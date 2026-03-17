@@ -31,8 +31,8 @@ services:
       # Default gateway port inside container
       - ZEROCLAW_GATEWAY_PORT=${ZEROCLAW_GATEWAY_PORT:-42617}
       
-      # Optional: Model override
-      # - ZEROCLAW_MODEL=anthropic/claude-sonnet-4-20250514
+      # Model override
+      - ZEROCLAW_MODEL=${ZEROCLAW_MODEL:-anthropic/claude-sonnet-4}
       
     volumes:
       # Persist workspace and config (must match WORKDIR/HOME in Dockerfile)
