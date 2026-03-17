@@ -1,53 +1,122 @@
-# CLAUDE.md — ZeroClaw
+# CLAUDE.md
 
-## Commands
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Build & Validate Commands
 
 ```bash
+# Lint
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+
+# Test (all unit + component + integration + system)
 cargo test
-```
 
-Full pre-PR validation (recommended):
+# Run a single test by name
+cargo test test_name_here
 
-```bash
+# Run a specific test suite
+cargo test --test component
+cargo test --test integration
+cargo test --test system
+cargo test --test live -- --ignored   # requires credentials
+
+# Build
+cargo build --release --locked
+cargo build --profile release-fast    # faster build, needs 16GB+ RAM
+
+# Full pre-PR validation (Docker-based: lint + test + build + security + docker-smoke)
 ./dev/ci.sh all
+
+# Individual CI steps
+./dev/ci.sh lint          # fmt + clippy
+./dev/ci.sh test          # cargo test --locked
+./dev/ci.sh build         # release build
+./dev/ci.sh security      # cargo audit + cargo deny
+./dev/ci.sh lint-delta    # strict clippy on changed lines only
+
+# Dev fallback (no global install)
+cargo run --release -- <subcommand>
 ```
 
 Docs-only changes: run markdown lint and link-integrity checks. If touching bootstrap scripts: `bash -n install.sh`.
 
-## Project Snapshot
+## Project Overview
 
-ZeroClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
+ZeroClaw is a Rust-first autonomous agent runtime. Single binary, <5MB RAM, <10ms cold start. Dual-licensed MIT/Apache-2.0.
 
-Core architecture is trait-driven and modular. Extend by implementing traits and registering in factory modules.
+Workspace: `Cargo.toml` defines a workspace with members `"."` and `crates/robot-kit`. MSRV is 1.87.
 
-Key extension points:
+## Architecture
 
-- `src/providers/traits.rs` (`Provider`)
-- `src/channels/traits.rs` (`Channel`)
-- `src/tools/traits.rs` (`Tool`)
-- `src/memory/traits.rs` (`Memory`)
-- `src/observability/traits.rs` (`Observer`)
-- `src/runtime/traits.rs` (`RuntimeAdapter`)
-- `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
+### Trait-Driven Extension Model
 
-## Repository Map
+Every major subsystem is a trait + factory. To add a new implementation: implement the trait, register it in the corresponding `mod.rs` factory function.
 
-- `src/main.rs` — CLI entrypoint and command routing
-- `src/lib.rs` — module exports and shared command enums
-- `src/config/` — schema + config loading/merging
-- `src/agent/` — orchestration loop
-- `src/gateway/` — webhook/gateway server
-- `src/security/` — policy, pairing, secret store
-- `src/memory/` — markdown/sqlite memory backends + embeddings/vector merge
-- `src/providers/` — model providers and resilient wrapper
-- `src/channels/` — Telegram/Discord/Slack/etc channels
-- `src/tools/` — tool execution surface (shell, file, memory, browser)
-- `src/peripherals/` — hardware peripherals (STM32, RPi GPIO)
-- `src/runtime/` — runtime adapters (currently native)
-- `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
-- `.github/` — CI, templates, automation workflows
+| Subsystem | Trait | Trait File | Factory/Registration |
+|-----------|-------|-----------|---------------------|
+| LLM Provider | `Provider` | `src/providers/traits.rs` | `src/providers/mod.rs` |
+| Channel | `Channel` | `src/channels/traits.rs` | `src/channels/mod.rs` |
+| Tool | `Tool` | `src/tools/traits.rs` | `src/tools/mod.rs` |
+| Memory | `Memory` | `src/memory/traits.rs` | `src/memory/mod.rs` |
+| Observer | `Observer` | `src/observability/traits.rs` | `src/observability/mod.rs` |
+| Runtime | `RuntimeAdapter` | `src/runtime/traits.rs` | `src/runtime/mod.rs` |
+| Peripheral | `Peripheral` | `src/peripherals/traits.rs` | `src/peripherals/mod.rs` |
+| Sandbox | `Sandbox` | `src/security/traits.rs` | `src/security/sandbox/detect.rs` |
+
+### Agent Orchestration (src/agent/)
+
+- `agent.rs` — `Agent` struct built via `AgentBuilder` (builder pattern). Holds `Arc<dyn Provider>`, `Arc<dyn Memory>`, `Arc<dyn Observer>`, etc.
+- `loop_.rs` — Main orchestration: `run()` → `process_message()` → LLM call → tool use loop (max 10 iterations) → response. Includes credential scrubbing and tool filtering per turn.
+- `dispatcher.rs` — `ToolDispatcher` parses LLM function calls, invokes tools, collects results. Has `NativeToolDispatcher` and `XmlToolDispatcher` variants.
+- `prompt.rs` — `SystemPromptBuilder` injects tool specs, memory context, identity, skills into system prompt.
+- `classifier.rs` — Routes user messages to models by classification hints.
+
+### Config System (src/config/)
+
+- `schema.rs` — Monolithic config schema (`serde` + `schemars::JsonSchema`). Top-level struct with nested sections for all subsystems.
+- `workspace.rs` — Config resolution: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`. Supports env var overrides (e.g., `ZEROCLAW_API_KEY`).
+- Format: TOML (`config.toml`).
+
+### Gateway (src/gateway/)
+
+Axum + Tower HTTP server. Key aspects:
+- Rate limiting (sliding-window per IP), 64KB body limit, 30s timeout
+- Endpoints: `POST /pair`, `GET /paircode`, `POST /webhook/{channel}`, `GET /ws`
+- Idempotency store prevents double-processing of retried webhooks
+- Pairing guard requires device authentication before webhook acceptance
+
+### Security (src/security/)
+
+- `policy.rs` — `SecurityPolicy` with `AutonomyLevel` (Supervised/Autonomous/Experimental), domain allowlist/blocklist
+- `pairing.rs` — Device auth with constant-time OTP comparison
+- `secrets.rs` — Encrypted credential storage (ChaCha20-Poly1305)
+- `estop.rs` — Emergency stop (KillAll, NetworkKill, DomainBlock, ToolFreeze), OTP-gated resume
+- `workspace_boundary.rs` — Prevents tool execution outside workspace
+- `sandbox/` — Pluggable backends: Docker, Firejail, Bubblewrap, Landlock; auto-detected at runtime
+- `prompt_guard.rs` — Prompt injection defense
+- `leak_detector.rs` — Credential leakage detection in tool outputs
+
+### Shared Patterns
+
+- **Async-first on Tokio.** All traits use `async_trait`. Channels use `tokio::sync::mpsc`.
+- **Arc-wrapped sharing.** Provider, Memory, Observer, SecurityPolicy passed as `Arc<dyn Trait>`.
+- **Feature gates** for optional subsystems: `hardware`, `channel-matrix`, `channel-lark`, `channel-nostr`, `whatsapp-web`, `browser-native`, `sandbox-landlock`, `observability-otel`, `memory-postgres`, `rag-pdf`, `probe`. Default features: `observability-prometheus`, `channel-nostr`.
+
+## Test Organization
+
+```
+tests/
+  test_component.rs   → includes tests/component/   (unit-level)
+  test_integration.rs → includes tests/integration/  (multi-subsystem)
+  test_system.rs      → includes tests/system/       (end-to-end)
+  test_live.rs        → includes tests/live/         (requires credentials, #[ignore])
+  fixtures/           → test data
+  support/            → test utilities
+  manual/             → manual test scripts (e.g., test_dockerignore.sh)
+```
+
+Inline `#[cfg(test)]` modules exist within each subsystem as well.
 
 ## Risk Tiers
 
@@ -70,7 +139,7 @@ Branch/commit/PR rules:
 - Work from a non-`master` branch. Open a PR to `master`; do not push directly.
 - Use conventional commit titles. Prefer small PRs (`size: XS/S/M`).
 - Follow `.github/pull_request_template.md` fully.
-- Never commit secrets, personal data, or real identity information (see `@docs/contributing/pr-discipline.md`).
+- Never commit secrets, personal data, or real identity information (see `@docs/contributing/pr-discipline.md`). Use neutral placeholders: `user_a`, `test_user`, `example.com`.
 
 ## Anti-Patterns
 
@@ -81,10 +150,10 @@ Branch/commit/PR rules:
 - Do not modify unrelated modules "while here".
 - Do not bypass failing checks without explicit explanation.
 - Do not hide behavior-changing side effects in refactor commits.
-- Do not include personal identity or sensitive information in test data, examples, docs, or commits.
+- Do not introduce cross-subsystem coupling (providers must not import channels internals, etc.).
 
 ## Linked References
 
-- `@docs/contributing/change-playbooks.md` — adding providers, channels, tools, peripherals; security/gateway changes; architecture boundaries
-- `@docs/contributing/pr-discipline.md` — privacy rules, superseded-PR attribution/templates, handoff template
-- `@docs/contributing/docs-contract.md` — docs system contract, i18n rules, locale parity
+- `docs/contributing/change-playbooks.md` — adding providers, channels, tools, peripherals; security/gateway changes; architecture boundaries
+- `docs/contributing/pr-discipline.md` — privacy rules, superseded-PR attribution/templates, handoff template
+- `docs/contributing/docs-contract.md` — docs system contract, i18n rules, locale parity

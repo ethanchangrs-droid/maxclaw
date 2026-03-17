@@ -1,0 +1,18 @@
+---
+description: 项目文件职责快速参考，说明feature_list.json、claude-progress.txt、PRD/SPEC/UI等文件的用途
+alwaysApply: true
+---
+
+# 快速参考：文件职责
+
+| 文件 | 职责 | 查询时机 |
+|------|------|---------|
+| **feature_list.json** | 唯一任务清单 | 想知道"还有什么要做" |
+| claude-progress.txt | 会话历史日志 | 想知道"上次做了什么" |
+| PRD/SPEC/UI | 需求与设计说明 | 想知道"功能怎么定义" |
+| README.md | 项目说明文档 | 想知道"项目怎么用" |
+
+**记住**：
+- 📋 查任务 → feature_list.json
+- 📝 查进度 → claude-progress.txt  
+- 📖 查需求 → PRD/SPEC/UI

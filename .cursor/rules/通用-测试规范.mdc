@@ -1,0 +1,8 @@
+---
+description: 测试规范，包括前端E2E测试、后端API测试和浏览器自动化测试方法；测试时应用
+alwaysApply: false
+---
+# 测试规范
+- 前端功能使用浏览器自动化工具进行端到端测试
+- 后端 API 使用终端命令（curl）或测试脚本验证
+- 使用 browser_snapshot 验证页面渲染，使用 browser_click 测试交互
