@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod chat_sse;
 pub mod nodes;
 pub mod sse;
 pub mod static_files;
@@ -687,6 +688,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/config", put(api::handle_api_config_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
 
+    // SSE chat needs a longer timeout (300s) for agent tool execution
+    let chat_sse_router = Router::new()
+        .route("/api/chat", post(chat_sse::handle_chat_sse))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(300),
+        ));
+
     // Build router with middleware
     let app = Router::new()
         // ── Admin routes (for CLI management) ──
@@ -735,6 +744,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
+        // ── SSE chat with extended timeout ──
+        .merge(chat_sse_router)
         // ── Config PUT with larger body limit ──
         .merge(config_put_router)
         .with_state(state)

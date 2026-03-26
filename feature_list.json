@@ -103,5 +103,13 @@
     "priority": "P3",
     "passes": false,
     "added": "2026-03-26"
+  },
+  {
+    "id": "F010",
+    "title": "SSE Chat 端点（POST + SSE 流式响应）",
+    "description": "在 Gateway 中新增 POST /api/chat 端点，以 SSE 流式返回 AgentEvent 事件（reasoning/tool_call/tool_result/chunk/done）。使客户端通过标准 HTTP 协议获得与 WebSocket /ws/chat 完全一致的实时事件流体验。支持远程连接（Cloudflare Tunnel 等）、移动网络友好（无长连接）。改动：1) 新增 src/gateway/chat_sse.rs（60-80 行）；2) mod.rs 注册路由 + 独立 300s 超时配置。不修改任何现有端点、Channel、Agent 核心。详见 docs/features/F010-sse-chat-endpoint_V1.0_202603261734.md",
+    "priority": "P0",
+    "passes": true,
+    "added": "2026-03-26"
   }
 ]

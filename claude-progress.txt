@@ -184,3 +184,41 @@
 - F004b（P3）：WS 路径补齐 MCP 工具初始化
 - F004c（P3）：WS 路径补齐 Peripheral 工具
 - F004d（P3）：WS 路径 Memory auto_save 增加长度门槛
+
+## 2026-03-26 18:12 CST — 会话 6
+
+### 完成内容
+- 完成 F010：SSE Chat 端点（POST + SSE 流式响应）
+  - 新增 src/gateway/chat_sse.rs（~140 行含测试）
+    - POST /api/chat 端点，接受 JSON body（message + 可选 session_id）
+    - PairingGuard Bearer Token 认证（复用现有机制）
+    - 创建 ephemeral Agent（from_config），设置 session_id（sse_ 前缀隔离）
+    - Spawn 后台任务调用 agent.turn()，错误通过 event channel 发送
+    - AgentEvent → SSE data: JSON 流转发（与 WS /ws/chat 完全一致的事件格式）
+    - KeepAlive 保活，stream 自动结束（agent 完成后 channel drop）
+    - 3 个单元测试（ChatRequest 反序列化）
+  - mod.rs 修改（+7 行）
+    - pub mod chat_sse 模块声明
+    - chat_sse_router 独立子路由器 + 300s TimeoutLayer
+    - .merge(chat_sse_router) 注册到主路由
+
+### 涉及文件
+- src/gateway/chat_sse.rs（新增）
+- src/gateway/mod.rs（+7 行）
+
+### 测试结果
+- cargo check: 零错误通过
+- cargo test -- chat_sse gateway: 209 通过（含 3 个新测试），0 失败
+
+### Git commit
+- （待提交）
+
+### 当前状态
+- F010 已完成并标记 passes: true
+- 代码处于可编译、可合并状态
+
+### 下一步
+- F002（P2）：WebSocket 真正流式输出
+- F004b（P3）：WS 路径补齐 MCP 工具初始化
+- F004c（P3）：WS 路径补齐 Peripheral 工具
+- F004d（P3）：WS 路径 Memory auto_save 增加长度门槛
