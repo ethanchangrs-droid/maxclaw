@@ -4284,6 +4284,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
                 self.bluesky.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.weixin.as_ref())),
+                self.weixin.is_some(),
+            ),
         ]
     }
 
@@ -5365,6 +5369,15 @@ pub struct WeixinConfig {
     /// Long-poll timeout in milliseconds. Default: 35000.
     #[serde(default)]
     pub poll_timeout_ms: Option<u64>,
+}
+
+impl ChannelConfig for WeixinConfig {
+    fn name() -> &'static str {
+        "WeiXin"
+    }
+    fn desc() -> &'static str {
+        "WeChat iLink Bot (personal account)"
+    }
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
