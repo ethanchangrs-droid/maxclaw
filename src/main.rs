@@ -462,6 +462,20 @@ Examples:
         config_command: ConfigCommands,
     },
 
+    /// WeChat iLink channel management
+    #[command(long_about = "\
+Manage the WeChat iLink personal account channel.
+
+Use 'login' to scan a QR code and obtain a bot_token, which is \
+then saved to config.toml automatically.
+
+Examples:
+  zeroclaw weixin login")]
+    Weixin {
+        #[command(subcommand)]
+        weixin_command: WeixinCommands,
+    },
+
     /// Generate shell completion script to stdout
     #[command(long_about = "\
 Generate shell completion scripts for `zeroclaw`.
@@ -587,6 +601,24 @@ enum AuthCommands {
     List,
     /// Show auth status with active profile and token expiry info
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum WeixinCommands {
+    /// Scan QR code to login and obtain iLink bot_token
+    #[command(long_about = "\
+Scan a WeChat QR code to authenticate with the iLink Bot API.
+
+Displays a QR code in the terminal. Scan it with WeChat, and \
+the bot_token is saved to config.toml automatically.
+
+After login, restart the daemon to activate the WeChat channel:
+  docker compose restart
+
+Examples:
+  zeroclaw weixin login
+  docker exec -it zeroclaw zeroclaw weixin login")]
+    Login,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1224,6 +1256,10 @@ async fn main() -> Result<()> {
             .await
         }
 
+        Commands::Weixin { weixin_command } => {
+            handle_weixin_command(weixin_command, config).await
+        }
+
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema => {
                 let schema = schemars::schema_for!(config::Config);
@@ -1234,6 +1270,181 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+    }
+}
+
+async fn handle_weixin_command(weixin_command: WeixinCommands, mut config: Config) -> Result<()> {
+    match weixin_command {
+        WeixinCommands::Login => weixin_login(&mut config).await,
+    }
+}
+
+const WEIXIN_ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+const WEIXIN_LOGIN_POLL_INTERVAL_SECS: u64 = 3;
+const WEIXIN_LOGIN_TIMEOUT_SECS: u64 = 120;
+
+async fn weixin_login(config: &mut Config) -> Result<()> {
+    println!("WeChat iLink QR Code Login");
+    println!("==========================");
+    println!();
+
+    let client = reqwest::Client::new();
+    let url = format!("{WEIXIN_ILINK_BASE_URL}/ilink/bot/get_bot_qrcode");
+
+    println!("Fetching QR code from iLink API...");
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({}))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .context("Failed to connect to iLink API")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("iLink get_bot_qrcode HTTP {status}: {body}");
+    }
+
+    #[derive(Deserialize)]
+    struct QrCodeResp {
+        #[serde(default)]
+        errcode: i64,
+        #[serde(default)]
+        errmsg: Option<String>,
+        #[serde(default)]
+        qrcode_url: String,
+        #[serde(default)]
+        uuid: String,
+    }
+
+    let qr_resp: QrCodeResp = resp.json().await.context("Failed to parse QR code response")?;
+    if qr_resp.errcode != 0 {
+        let msg = qr_resp.errmsg.as_deref().unwrap_or("unknown");
+        bail!("iLink get_bot_qrcode errcode={}: {msg}", qr_resp.errcode);
+    }
+    if qr_resp.qrcode_url.is_empty() {
+        bail!("iLink returned empty qrcode_url");
+    }
+
+    #[cfg(feature = "channel-weixin")]
+    {
+        let qr = qrcode::QrCode::new(qr_resp.qrcode_url.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Failed to encode QR code: {e}"))?;
+        let rendered = qr
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build();
+        println!("{rendered}");
+    }
+
+    #[cfg(not(feature = "channel-weixin"))]
+    {
+        println!("QR code URL (scan with WeChat):");
+        println!("  {}", qr_resp.qrcode_url);
+        println!();
+        println!(
+            "Note: Build with `--features channel-weixin` to display QR code in terminal."
+        );
+    }
+
+    println!();
+    println!("Scan the QR code with WeChat...");
+    println!("Waiting for login (timeout: {WEIXIN_LOGIN_TIMEOUT_SECS}s)");
+
+    let poll_url = format!("{WEIXIN_ILINK_BASE_URL}/ilink/bot/get_qrcode_status");
+    let started = std::time::Instant::now();
+
+    loop {
+        if started.elapsed().as_secs() > WEIXIN_LOGIN_TIMEOUT_SECS {
+            bail!(
+                "Login timed out after {WEIXIN_LOGIN_TIMEOUT_SECS}s. Please try again."
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(
+            WEIXIN_LOGIN_POLL_INTERVAL_SECS,
+        ))
+        .await;
+
+        let poll_resp = client
+            .post(&poll_url)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "uuid": &qr_resp.uuid }))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+
+        let poll_resp = match poll_resp {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("Poll request failed: {e}");
+                continue;
+            }
+        };
+
+        if !poll_resp.status().is_success() {
+            continue;
+        }
+
+        #[derive(Deserialize)]
+        struct StatusResp {
+            #[serde(default)]
+            errcode: i64,
+            #[serde(default)]
+            status: i32,
+            #[serde(default)]
+            bot_token: Option<String>,
+        }
+
+        let status: StatusResp = match poll_resp.json().await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if status.errcode != 0 {
+            tracing::debug!("Poll errcode={}", status.errcode);
+            continue;
+        }
+
+        // status: 0=pending, 1=scanned, 2=confirmed
+        match status.status {
+            0 => {
+                print!(".");
+                let _ = std::io::stdout().flush();
+            }
+            1 => {
+                println!();
+                println!("QR code scanned! Waiting for confirmation...");
+            }
+            2 => {
+                println!();
+                let token = status
+                    .bot_token
+                    .filter(|t| !t.is_empty())
+                    .context("Login confirmed but no bot_token received")?;
+
+                let weixin_cfg = config::schema::WeixinConfig {
+                    bot_token: token,
+                    base_url: None,
+                    allowed_users: vec![],
+                    poll_timeout_ms: None,
+                };
+                config.channels_config.weixin = Some(weixin_cfg);
+                config.save().await.context("Failed to save config")?;
+
+                println!("Login successful! bot_token saved to config.toml");
+                println!();
+                println!("To activate the WeChat channel, restart the daemon:");
+                println!("  docker compose restart");
+                println!("  # or: zeroclaw daemon");
+                return Ok(());
+            }
+            other => {
+                tracing::debug!("Unknown poll status: {other}");
+            }
+        }
     }
 }
 

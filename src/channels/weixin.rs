@@ -1,5 +1,6 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,8 @@ const DEFAULT_POLL_TIMEOUT_MS: u64 = 35_000;
 const MAX_MESSAGE_LENGTH: usize = 2000;
 const POLL_ERROR_BACKOFF_SECS: u64 = 5;
 const TOKEN_FILE_NAME: &str = "weixin_context_tokens.json";
+const CURSOR_FILE_NAME: &str = "weixin_cursor.txt";
+const TYPING_INTERVAL_SECS: u64 = 4;
 
 /// WeChat personal account channel via iLink Bot HTTP API.
 ///
@@ -24,6 +27,8 @@ pub struct WeixinChannel {
     poll_timeout_ms: u64,
     context_tokens: Arc<RwLock<HashMap<String, String>>>,
     token_store_path: PathBuf,
+    cursor_store_path: PathBuf,
+    typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,7 +90,9 @@ impl WeixinChannel {
         workspace_dir: Option<&Path>,
     ) -> Self {
         let store_dir = workspace_dir.unwrap_or_else(|| Path::new("."));
-        let token_store_path = store_dir.join("weixin").join(TOKEN_FILE_NAME);
+        let weixin_dir = store_dir.join("weixin");
+        let token_store_path = weixin_dir.join(TOKEN_FILE_NAME);
+        let cursor_store_path = weixin_dir.join(CURSOR_FILE_NAME);
 
         Self {
             bot_token,
@@ -94,6 +101,8 @@ impl WeixinChannel {
             poll_timeout_ms: poll_timeout_ms.unwrap_or(DEFAULT_POLL_TIMEOUT_MS),
             context_tokens: Arc::new(RwLock::new(HashMap::new())),
             token_store_path,
+            cursor_store_path,
+            typing_handle: Mutex::new(None),
         }
     }
 
@@ -250,6 +259,55 @@ impl WeixinChannel {
         }
     }
 
+    async fn send_typing_request(
+        &self,
+        to: &str,
+        context_token: &str,
+    ) -> anyhow::Result<()> {
+        let url = format!("{}/ilink/bot/sendtyping", self.base_url);
+        let _ = self
+            .http_client()
+            .post(&url)
+            .headers(self.build_headers())
+            .json(&serde_json::json!({
+                "to_user_id": to,
+                "context_token": context_token,
+            }))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+        Ok(())
+    }
+
+    async fn save_cursor(&self, cursor: &str) {
+        if let Some(parent) = self.cursor_store_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Err(e) = tokio::fs::write(&self.cursor_store_path, cursor).await {
+            tracing::warn!("Failed to persist weixin cursor: {e}");
+        }
+    }
+
+    async fn load_cursor(&self) -> String {
+        match tokio::fs::read_to_string(&self.cursor_store_path).await {
+            Ok(cursor) => {
+                let cursor = cursor.trim().to_string();
+                if !cursor.is_empty() {
+                    tracing::info!("Loaded weixin cursor from disk");
+                }
+                cursor
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!("No existing weixin cursor file");
+                String::new()
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read weixin cursor file: {e}");
+                String::new()
+            }
+        }
+    }
+
     fn extract_text(msg: &WeixinMessage) -> Option<String> {
         for item in &msg.item_list {
             if item.item_type == 1 {
@@ -317,14 +375,17 @@ impl Channel for WeixinChannel {
     ) -> anyhow::Result<()> {
         self.load_tokens().await;
 
-        let mut cursor = String::new();
+        let mut cursor = self.load_cursor().await;
 
         tracing::info!("WeiXin iLink channel listening for messages...");
 
         loop {
             match self.poll_messages(&cursor).await {
                 Ok((msgs, new_cursor)) => {
-                    cursor = new_cursor;
+                    if new_cursor != cursor {
+                        cursor = new_cursor;
+                        self.save_cursor(&cursor).await;
+                    }
 
                     for msg in msgs {
                         if msg.from_user_id.is_empty() {
@@ -411,6 +472,54 @@ impl Channel for WeixinChannel {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
         }
+    }
+
+    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        self.stop_typing(recipient).await?;
+
+        let context_token = match self.get_context_token(recipient).await {
+            Some(t) => t,
+            None => {
+                tracing::debug!(
+                    "WeiXin: no context_token for {recipient}, skipping typing indicator"
+                );
+                return Ok(());
+            }
+        };
+
+        let client = self.http_client();
+        let headers = self.build_headers();
+        let url = format!("{}/ilink/bot/sendtyping", self.base_url);
+        let user_id = recipient.to_string();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let _ = client
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&serde_json::json!({
+                        "to_user_id": &user_id,
+                        "context_token": &context_token,
+                    }))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(TYPING_INTERVAL_SECS)).await;
+            }
+        });
+
+        let mut guard = self.typing_handle.lock();
+        *guard = Some(handle);
+
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        let mut guard = self.typing_handle.lock();
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+        Ok(())
     }
 }
 
@@ -525,5 +634,57 @@ bot_token = "tk"
         assert!(config.allowed_users.is_empty());
         assert!(config.base_url.is_none());
         assert!(config.poll_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn typing_handle_starts_as_none() {
+        let ch = WeixinChannel::new("t".into(), None, vec![], None, None);
+        let guard = ch.typing_handle.lock();
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_typing_clears_handle() {
+        let ch = WeixinChannel::new("t".into(), None, vec![], None, None);
+        {
+            let mut guard = ch.typing_handle.lock();
+            *guard = Some(tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }));
+        }
+        ch.stop_typing("user1").await.unwrap();
+        let guard = ch.typing_handle.lock();
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn cursor_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ch = WeixinChannel::new(
+            "t".into(),
+            None,
+            vec![],
+            None,
+            Some(dir.path()),
+        );
+
+        assert!(ch.load_cursor().await.is_empty());
+
+        ch.save_cursor("cursor_abc_123").await;
+        let loaded = ch.load_cursor().await;
+        assert_eq!(loaded, "cursor_abc_123");
+
+        ch.save_cursor("cursor_def_456").await;
+        let loaded2 = ch.load_cursor().await;
+        assert_eq!(loaded2, "cursor_def_456");
+    }
+
+    #[tokio::test]
+    async fn start_typing_skips_without_context_token() {
+        let ch = WeixinChannel::new("t".into(), None, vec![], None, None);
+        let result = ch.start_typing("unknown_user").await;
+        assert!(result.is_ok());
+        let guard = ch.typing_handle.lock();
+        assert!(guard.is_none());
     }
 }
