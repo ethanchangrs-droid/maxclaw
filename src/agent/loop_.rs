@@ -1,3 +1,4 @@
+use crate::agent::agent::AgentEvent;
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -32,6 +33,14 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+/// Result of `run_tool_call_loop` with metadata useful for callers.
+#[derive(Debug)]
+pub(crate) struct LoopOutcome {
+    pub text: String,
+    /// Number of LLM iterations used (1 = first-round text, no tool calls).
+    pub iterations_used: usize,
+}
 
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.find('*') {
@@ -2150,11 +2159,13 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
+        None,
         &[],
         &[],
         None,
     )
     .await
+    .map(|outcome| outcome.text)
 }
 
 async fn execute_one_tool(
@@ -2354,11 +2365,12 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    event_sender: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-) -> Result<String> {
+) -> Result<LoopOutcome> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -2468,7 +2480,7 @@ pub(crate) async fn run_tool_call_loop(
             chat_future.await
         };
 
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
+        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls, reasoning_content_for_trace) =
             match chat_result {
                 Ok(resp) => {
                     let (resp_input_tokens, resp_output_tokens) = resp
@@ -2539,12 +2551,18 @@ pub(crate) async fn run_tool_call_loop(
                             "raw_response": scrub_credentials(&response_text),
                             "native_tool_calls": resp.tool_calls.len(),
                             "parsed_tool_calls": calls.len(),
+                            "reasoning_content": resp.reasoning_content,
                         }),
                     );
 
                     // Preserve native tool call IDs in assistant history so role=tool
                     // follow-up messages can reference the exact call id.
                     let reasoning_content = resp.reasoning_content.clone();
+
+                    if let (Some(ref rc), Some(ref tx)) = (&reasoning_content, &event_sender) {
+                        let _ = tx.send(AgentEvent::Reasoning(rc.clone())).await;
+                    }
+
                     let assistant_history_content = if resp.tool_calls.is_empty() {
                         if use_native_tools {
                             build_native_assistant_history_from_parsed_calls(
@@ -2571,6 +2589,7 @@ pub(crate) async fn run_tool_call_loop(
                         calls,
                         assistant_history_content,
                         native_calls,
+                        reasoning_content,
                     )
                 }
                 Err(e) => {
@@ -2630,6 +2649,7 @@ pub(crate) async fn run_tool_call_loop(
                 serde_json::json!({
                     "iteration": iteration + 1,
                     "text": scrub_credentials(&display_text),
+                    "reasoning_content": reasoning_content_for_trace,
                 }),
             );
             // No tool calls — this is the final response.
@@ -2660,13 +2680,31 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+
+            if let Some(ref tx) = event_sender {
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        text: display_text.clone(),
+                        reasoning_content: reasoning_content_for_trace.clone(),
+                    })
+                    .await;
+            }
+
+            return Ok(LoopOutcome {
+                text: display_text,
+                iterations_used: iteration + 1,
+            });
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
         if !silent && !display_text.is_empty() {
             print!("{display_text}");
             let _ = std::io::stdout().flush();
+        }
+        if let Some(ref tx) = event_sender {
+            if !display_text.is_empty() {
+                let _ = tx.send(AgentEvent::Chunk(display_text.clone())).await;
+            }
         }
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
@@ -2856,6 +2894,14 @@ pub(crate) async fn run_tool_call_loop(
                 tracing::debug!(tool = %tool_name, "Sending progress start to draft");
                 let _ = tx.send(progress).await;
             }
+            if let Some(ref tx) = event_sender {
+                let _ = tx
+                    .send(AgentEvent::ToolCallStart {
+                        name: tool_name.clone(),
+                        arguments: tool_args.clone(),
+                    })
+                    .await;
+            }
 
             executable_indices.push(idx);
             executable_calls.push(ParsedToolCall {
@@ -2934,6 +2980,16 @@ pub(crate) async fn run_tool_call_loop(
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
                 let _ = tx.send(progress_msg).await;
+            }
+            if let Some(ref tx) = event_sender {
+                let _ = tx
+                    .send(AgentEvent::ToolCallComplete {
+                        name: call.name.clone(),
+                        output: outcome.output.clone(),
+                        success: outcome.success,
+                        duration_ms: outcome.duration.as_millis() as u64,
+                    })
+                    .await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -3452,7 +3508,7 @@ pub async fn run(
         let excluded_tools =
             compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, &msg);
 
-        let response = run_tool_call_loop(
+        let outcome = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
             &tools_registry,
@@ -3468,13 +3524,14 @@ pub async fn run(
             None,
             None,
             None,
+            None,
             &excluded_tools,
             &config.agent.tool_call_dedup_exempt,
             activated_handle.as_ref(),
         )
         .await?;
-        final_output = response.clone();
-        println!("{response}");
+        final_output = outcome.text.clone();
+        println!("{}", outcome.text);
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
@@ -3630,13 +3687,14 @@ pub async fn run(
                 None,
                 None,
                 None,
+                None,
                 &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
                 activated_handle.as_ref(),
             )
             .await
             {
-                Ok(resp) => resp,
+                Ok(outcome) => outcome.text,
                 Err(e) => {
                     eprintln!("\nError: {e}\n");
                     continue;
@@ -4348,6 +4406,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -4396,6 +4455,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -4438,6 +4498,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -4445,7 +4506,7 @@ mod tests {
         .await
         .expect("valid multimodal payload should pass");
 
-        assert_eq!(result, "vision-ok");
+        assert_eq!(result.text, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -4566,6 +4627,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -4573,7 +4635,7 @@ mod tests {
         .await
         .expect("parallel execution should complete");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert!(
             max_active.load(Ordering::SeqCst) >= 1,
             "tools should execute successfully"
@@ -4637,6 +4699,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -4644,7 +4707,7 @@ mod tests {
         .await
         .expect("loop should finish after deduplicating repeated calls");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(
             invocations.load(Ordering::SeqCst),
             1,
@@ -4700,6 +4763,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &exempt,
             None,
@@ -4707,7 +4771,7 @@ mod tests {
         .await
         .expect("loop should finish with exempt tool executing twice");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(
             invocations.load(Ordering::SeqCst),
             2,
@@ -4778,6 +4842,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &exempt,
             None,
@@ -4833,6 +4898,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -4840,7 +4906,7 @@ mod tests {
         .await
         .expect("native fallback id flow should complete");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
             history.iter().any(|msg| {
@@ -6735,6 +6801,7 @@ Let me check the result."#;
             None,
             Some(tx),
             None,
+            None,
             &[],
             &[],
             None,
@@ -6762,7 +6829,7 @@ Let me check the result."#;
             "on_delta messages should include ❌ for failed tool calls, got: {all_deltas}"
         );
 
-        assert_eq!(result, "I could not execute that command.");
+        assert_eq!(result.text, "I could not execute that command.");
     }
 
     // ── filter_by_allowed_tools tests ─────────────────────────────────────

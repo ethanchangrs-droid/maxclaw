@@ -63,6 +63,7 @@ fn agent_config_default_max_history_messages() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn agent_config_default_tool_dispatcher() {
     let agent = AgentConfig::default();
     assert_eq!(

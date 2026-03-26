@@ -4,7 +4,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw::agent::agent::Agent;
-use zeroclaw::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
 use zeroclaw::agent::memory_loader::MemoryLoader;
 use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory;
@@ -47,30 +46,20 @@ pub fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     }
 }
 
-/// Build an agent with `NativeToolDispatcher`.
 pub fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
         .provider(provider)
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
         .build()
         .unwrap()
 }
 
-/// Build an agent with `XmlToolDispatcher`.
+/// Alias kept for backward compatibility with existing tests.
 pub fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
-    Agent::builder()
-        .provider(provider)
-        .tools(tools)
-        .memory(make_memory())
-        .observer(make_observer())
-        .tool_dispatcher(Box::new(XmlToolDispatcher))
-        .workspace_dir(std::env::temp_dir())
-        .build()
-        .unwrap()
+    build_agent(provider, tools)
 }
 
 /// Build an agent with optional custom `MemoryLoader`.
@@ -84,7 +73,6 @@ pub fn build_recording_agent(
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir());
 
     if let Some(loader) = memory_loader {
@@ -110,7 +98,6 @@ pub fn build_agent_with_sqlite_memory(
         .tools(tools)
         .memory(mem)
         .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
         .build()
         .unwrap()

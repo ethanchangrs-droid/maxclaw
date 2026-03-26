@@ -13,7 +13,7 @@ use crate::support::helpers::{
 };
 use crate::support::{CountingTool, EchoTool, MockProvider, RecordingProvider};
 use zeroclaw::providers::traits::ChatMessage;
-use zeroclaw::providers::{ChatResponse, ConversationMessage, ToolCall};
+use zeroclaw::providers::{ChatResponse, ToolCall};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // E2E smoke tests — full agent turn cycle
@@ -60,12 +60,12 @@ async fn e2e_multi_step_tool_chain() {
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "counter".into(),
-            arguments: "{}".into(),
+            arguments: r#"{"step":1}"#.into(),
         }]),
         tool_response(vec![ToolCall {
             id: "tc2".into(),
             name: "counter".into(),
-            arguments: "{}".into(),
+            arguments: r#"{"step":2}"#.into(),
         }]),
         text_response("Done after 2 tool calls"),
     ]));
@@ -158,12 +158,12 @@ async fn e2e_parallel_tool_dispatch() {
             ToolCall {
                 id: "tc1".into(),
                 name: "counter".into(),
-                arguments: "{}".into(),
+                arguments: r#"{"batch":1}"#.into(),
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "counter".into(),
-                arguments: "{}".into(),
+                arguments: r#"{"batch":2}"#.into(),
             },
         ]),
         text_response("Both tools ran"),
@@ -246,12 +246,10 @@ async fn e2e_multi_turn_history_fidelity() {
     // Verify agent history: system + 3*(user + assistant) = 7
     let history = agent.history();
     assert_eq!(history.len(), 7);
-    assert!(matches!(&history[0], ConversationMessage::Chat(c) if c.role == "system"));
-    assert!(matches!(&history[1], ConversationMessage::Chat(c) if c.role == "user"));
-    assert!(matches!(&history[2], ConversationMessage::Chat(c) if c.role == "assistant"));
-    assert!(
-        matches!(&history[6], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "response 3")
-    );
+    assert_eq!(history[0].role, "system");
+    assert_eq!(history[1].role, "user");
+    assert_eq!(history[2].role, "assistant");
+    assert!(history[6].role == "assistant" && history[6].content == "response 3");
 }
 
 /// Validates that a custom MemoryLoader injects RAG context into user
@@ -289,14 +287,9 @@ async fn e2e_memory_enrichment_injects_context() {
 
     // Agent history also stores enriched message
     let history = agent.history();
-    match &history[1] {
-        ConversationMessage::Chat(c) => {
-            assert_eq!(c.role, "user");
-            assert!(c.content.starts_with("[Memory context]"));
-            assert!(c.content.ends_with("hello"));
-        }
-        other => panic!("Expected Chat variant for user message, got: {other:?}"),
-    }
+    assert_eq!(history[1].role, "user");
+    assert!(history[1].content.starts_with("[Memory context]"));
+    assert!(history[1].content.ends_with("hello"));
 }
 
 /// Validates multi-turn conversation with memory enrichment: every user

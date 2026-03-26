@@ -1057,8 +1057,10 @@ pub struct AgentConfig {
     /// Enable parallel tool execution within a single iteration. Default: `false`.
     #[serde(default)]
     pub parallel_tools: bool,
-    /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
+    /// Deprecated: tool dispatch strategy. Ignored since loop unification (F003).
+    /// Kept for backward-compatible deserialization of existing config files.
     #[serde(default = "default_agent_tool_dispatcher")]
+    #[deprecated(note = "No longer used after agent loop unification")]
     pub tool_dispatcher: String,
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
@@ -1089,6 +1091,7 @@ fn default_agent_tool_dispatcher() -> String {
 }
 
 impl Default for AgentConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             compact_context: false,
@@ -8474,6 +8477,7 @@ reasoning_enabled = false
     }
 
     #[test]
+    #[allow(deprecated)]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
@@ -8484,6 +8488,7 @@ reasoning_enabled = false
     }
 
     #[test]
+    #[allow(deprecated)]
     async fn agent_config_deserializes() {
         let raw = r#"
 default_temperature = 0.7

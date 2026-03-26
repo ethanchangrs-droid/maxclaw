@@ -419,6 +419,7 @@ impl DelegateTool {
                 None,
                 None,
                 None,
+                None,
                 &[],
                 &[],
                 None,
@@ -427,11 +428,11 @@ impl DelegateTool {
         .await;
 
         match result {
-            Ok(Ok(response)) => {
-                let rendered = if response.trim().is_empty() {
+            Ok(Ok(outcome)) => {
+                let rendered = if outcome.text.trim().is_empty() {
                     "[Empty response]".to_string()
                 } else {
-                    response
+                    outcome.text
                 };
 
                 Ok(ToolResult {

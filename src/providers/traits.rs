@@ -101,24 +101,6 @@ pub struct ToolResultMessage {
     pub content: String,
 }
 
-/// A message in a multi-turn conversation, including tool interactions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
-pub enum ConversationMessage {
-    /// Regular chat message (system, user, assistant).
-    Chat(ChatMessage),
-    /// Tool calls from the assistant (stored for history fidelity).
-    AssistantToolCalls {
-        text: Option<String>,
-        tool_calls: Vec<ToolCall>,
-        /// Raw reasoning content from thinking models, preserved for round-trip
-        /// fidelity with provider APIs that require it.
-        reasoning_content: Option<String>,
-    },
-    /// Results of tool executions, fed back to the LLM.
-    ToolResults(Vec<ToolResultMessage>),
-}
-
 /// A chunk of content from a streaming response.
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
@@ -593,20 +575,6 @@ mod tests {
         let json = serde_json::to_string(&tc).unwrap();
         assert!(json.contains("call_123"));
         assert!(json.contains("file_read"));
-    }
-
-    #[test]
-    fn conversation_message_variants() {
-        let chat = ConversationMessage::Chat(ChatMessage::user("hi"));
-        let json = serde_json::to_string(&chat).unwrap();
-        assert!(json.contains("\"type\":\"Chat\""));
-
-        let tool_result = ConversationMessage::ToolResults(vec![ToolResultMessage {
-            tool_call_id: "1".into(),
-            content: "done".into(),
-        }]);
-        let json = serde_json::to_string(&tool_result).unwrap();
-        assert!(json.contains("\"type\":\"ToolResults\""));
     }
 
     #[test]

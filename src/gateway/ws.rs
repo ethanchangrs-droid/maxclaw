@@ -10,6 +10,7 @@
 //! ```
 
 use super::AppState;
+use crate::agent::AgentEvent;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -131,6 +132,24 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
     };
     agent.set_memory_session_id(session_id.clone());
 
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
+    let error_event_tx = event_tx.clone();
+    agent.set_event_sender(Some(event_tx));
+
+    // WebSocket write queue serialises all outbound frames.  All agent
+    // events — including errors — flow through the forwarder to preserve
+    // strict FIFO ordering with preceding Reasoning/ToolCall events.
+    let (ws_write_tx, mut ws_write_rx) = tokio::sync::mpsc::channel::<Message>(64);
+    let write_handle = tokio::spawn(async move {
+        while let Some(msg) = ws_write_rx.recv().await {
+            if sender.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let forward_handle = forward_agent_events(event_rx, ws_write_tx.clone());
+
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
             Ok(Message::Text(text)) => text,
@@ -142,8 +161,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
         let parsed: serde_json::Value = match serde_json::from_str(&msg) {
             Ok(v) => v,
             Err(_) => {
-                let err = serde_json::json!({"type": "error", "message": "Invalid JSON"});
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = error_event_tx
+                    .send(AgentEvent::Error {
+                        message: "Invalid JSON".into(),
+                    })
+                    .await;
                 continue;
             }
         };
@@ -175,15 +197,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
 
         // Multi-turn chat via persistent Agent (history is maintained across turns)
         match agent.turn(&content).await {
-            Ok(response) => {
-                // Send the full response as a done message
-                let done = serde_json::json!({
-                    "type": "done",
-                    "full_response": response,
-                });
-                let _ = sender.send(Message::Text(done.to_string().into())).await;
+            Ok(_response) => {
+                // The done message is sent by forward_agent_events when it
+                // processes AgentEvent::Done, preserving FIFO ordering with
+                // preceding Reasoning/ToolCall events in the event channel.
 
-                // Broadcast agent_end event
+                // Broadcast agent_end event (SSE, separate from WS)
                 let _ = state.event_tx.send(serde_json::json!({
                     "type": "agent_end",
                     "provider": provider_label,
@@ -192,13 +211,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
             }
             Err(e) => {
                 let sanitized = crate::providers::sanitize_api_error(&e.to_string());
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": sanitized,
-                });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
 
-                // Broadcast error event
+                // Send error through the event channel so it is FIFO-ordered
+                // after any pending ToolCallComplete / Reasoning events.
+                let _ = error_event_tx
+                    .send(AgentEvent::Error {
+                        message: sanitized.clone(),
+                    })
+                    .await;
+
+                // Broadcast error event (SSE, separate from WS)
                 let _ = state.event_tx.send(serde_json::json!({
                     "type": "error",
                     "component": "ws_chat",
@@ -207,6 +229,63 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
             }
         }
     }
+
+    drop(ws_write_tx);
+    drop(error_event_tx);
+    forward_handle.abort();
+    let _ = write_handle.await;
+}
+
+fn forward_agent_events(
+    mut event_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    ws_tx: tokio::sync::mpsc::Sender<Message>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            let msg = match event {
+                AgentEvent::Reasoning(content) => serde_json::json!({
+                    "type": "reasoning",
+                    "content": content,
+                }),
+                AgentEvent::Chunk(content) => serde_json::json!({
+                    "type": "chunk",
+                    "content": content,
+                }),
+                AgentEvent::ToolCallStart { name, arguments } => serde_json::json!({
+                    "type": "tool_call",
+                    "name": name,
+                    "args": arguments,
+                }),
+                AgentEvent::ToolCallComplete {
+                    name,
+                    output,
+                    success,
+                    duration_ms,
+                } => serde_json::json!({
+                    "type": "tool_result",
+                    "name": name,
+                    "output": output,
+                    "success": success,
+                    "duration_ms": duration_ms,
+                }),
+                AgentEvent::Done { text, .. } => serde_json::json!({
+                    "type": "done",
+                    "full_response": text,
+                }),
+                AgentEvent::Error { message } => serde_json::json!({
+                    "type": "error",
+                    "message": message,
+                }),
+            };
+            if ws_tx
+                .send(Message::Text(msg.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
 }
 
 #[cfg(test)]

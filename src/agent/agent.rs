@@ -1,20 +1,40 @@
-use crate::agent::dispatcher::{
-    NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
-};
+use crate::agent::loop_::{self, run_tool_call_loop, LoopOutcome};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
+
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    Reasoning(String),
+    Chunk(String),
+    ToolCallStart {
+        name: String,
+        arguments: serde_json::Value,
+    },
+    ToolCallComplete {
+        name: String,
+        output: String,
+        success: bool,
+        duration_ms: u64,
+    },
+    Done {
+        text: String,
+        reasoning_content: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+}
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -23,9 +43,9 @@ pub struct Agent {
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
-    tool_dispatcher: Box<dyn ToolDispatcher>,
     memory_loader: Box<dyn MemoryLoader>,
     config: crate::config::AgentConfig,
+    provider_name: String,
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
@@ -34,12 +54,13 @@ pub struct Agent {
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
     memory_session_id: Option<String>,
-    history: Vec<ConversationMessage>,
+    history: Vec<ChatMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
+    event_sender: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
 }
 
 pub struct AgentBuilder {
@@ -48,9 +69,9 @@ pub struct AgentBuilder {
     memory: Option<Arc<dyn Memory>>,
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
-    tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_loader: Option<Box<dyn MemoryLoader>>,
     config: Option<crate::config::AgentConfig>,
+    provider_name: Option<String>,
     model_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
@@ -74,9 +95,9 @@ impl AgentBuilder {
             memory: None,
             observer: None,
             prompt_builder: None,
-            tool_dispatcher: None,
             memory_loader: None,
             config: None,
+            provider_name: None,
             model_name: None,
             temperature: None,
             workspace_dir: None,
@@ -118,11 +139,6 @@ impl AgentBuilder {
         self
     }
 
-    pub fn tool_dispatcher(mut self, tool_dispatcher: Box<dyn ToolDispatcher>) -> Self {
-        self.tool_dispatcher = Some(tool_dispatcher);
-        self
-    }
-
     pub fn memory_loader(mut self, memory_loader: Box<dyn MemoryLoader>) -> Self {
         self.memory_loader = Some(memory_loader);
         self
@@ -130,6 +146,11 @@ impl AgentBuilder {
 
     pub fn config(mut self, config: crate::config::AgentConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    pub fn provider_name(mut self, provider_name: String) -> Self {
+        self.provider_name = Some(provider_name);
         self
     }
 
@@ -232,13 +253,11 @@ impl AgentBuilder {
             prompt_builder: self
                 .prompt_builder
                 .unwrap_or_else(SystemPromptBuilder::with_defaults),
-            tool_dispatcher: self
-                .tool_dispatcher
-                .ok_or_else(|| anyhow::anyhow!("tool_dispatcher is required"))?,
             memory_loader: self
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
+            provider_name: self.provider_name.unwrap_or_else(|| "unknown".into()),
             model_name: self
                 .model_name
                 .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
@@ -257,6 +276,7 @@ impl AgentBuilder {
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
             allowed_tools: allowed,
             response_cache: self.response_cache,
+            event_sender: None,
         })
     }
 }
@@ -266,7 +286,7 @@ impl Agent {
         AgentBuilder::new()
     }
 
-    pub fn history(&self) -> &[ConversationMessage] {
+    pub fn history(&self) -> &[ChatMessage] {
         &self.history
     }
 
@@ -276,6 +296,10 @@ impl Agent {
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
+    }
+
+    pub fn set_event_sender(&mut self, tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>) {
+        self.event_sender = tx;
     }
 
     pub fn from_config(config: &Config) -> Result<Self> {
@@ -340,14 +364,6 @@ impl Agent {
             &model_name,
         )?;
 
-        let dispatcher_choice = config.agent.tool_dispatcher.as_str();
-        let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
-            "native" => Box::new(NativeToolDispatcher),
-            "xml" => Box::new(XmlToolDispatcher),
-            _ if provider.supports_native_tools() => Box::new(NativeToolDispatcher),
-            _ => Box::new(XmlToolDispatcher),
-        };
-
         let route_model_by_hint: HashMap<String, String> = config
             .model_routes
             .iter()
@@ -374,7 +390,7 @@ impl Agent {
             .memory(memory)
             .observer(observer)
             .response_cache(response_cache)
-            .tool_dispatcher(tool_dispatcher)
+            .provider_name(provider_name.to_string())
             .memory_loader(Box::new(DefaultMemoryLoader::new(
                 5,
                 config.memory.min_relevance_score,
@@ -407,11 +423,10 @@ impl Agent {
         let mut other_messages = Vec::new();
 
         for msg in self.history.drain(..) {
-            match &msg {
-                ConversationMessage::Chat(chat) if chat.role == "system" => {
-                    system_messages.push(msg);
-                }
-                _ => other_messages.push(msg),
+            if msg.role == "system" {
+                system_messages.push(msg);
+            } else {
+                other_messages.push(msg);
             }
         }
 
@@ -425,7 +440,11 @@ impl Agent {
     }
 
     fn build_system_prompt(&self) -> Result<String> {
-        let instructions = self.tool_dispatcher.prompt_instructions(&self.tools);
+        let instructions = if self.provider.supports_native_tools() {
+            String::new()
+        } else {
+            loop_::build_tool_instructions(&self.tools)
+        };
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             model_name: &self.model_name,
@@ -433,63 +452,9 @@ impl Agent {
             skills: &self.skills,
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
-            dispatcher_instructions: &instructions,
+            tool_instructions: &instructions,
         };
         self.prompt_builder.build(&ctx)
-    }
-
-    async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
-        let start = Instant::now();
-
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            match tool.execute(call.arguments.clone()).await {
-                Ok(r) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: r.success,
-                    });
-                    if r.success {
-                        r.output
-                    } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
-                    }
-                }
-                Err(e) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: false,
-                    });
-                    format!("Error executing {}: {e}", call.name)
-                }
-            }
-        } else {
-            format!("Unknown tool: {}", call.name)
-        };
-
-        ToolExecutionResult {
-            name: call.name.clone(),
-            output: result,
-            success: true,
-            tool_call_id: call.tool_call_id.clone(),
-        }
-    }
-
-    async fn execute_tools(&self, calls: &[ParsedToolCall]) -> Vec<ToolExecutionResult> {
-        if !self.config.parallel_tools {
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                results.push(self.execute_tool_call(call).await);
-            }
-            return results;
-        }
-
-        let futs: Vec<_> = calls
-            .iter()
-            .map(|call| self.execute_tool_call(call))
-            .collect();
-        futures_util::future::join_all(futs).await
     }
 
     fn classify_model(&self, user_message: &str) -> String {
@@ -519,10 +484,7 @@ impl Agent {
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
-            self.history
-                .push(ConversationMessage::Chat(ChatMessage::system(
-                    system_prompt,
-                )));
+            self.history.push(ChatMessage::system(system_prompt));
         }
 
         if self.auto_save {
@@ -554,127 +516,98 @@ impl Agent {
             format!("{context}[{now}] {user_message}")
         };
 
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
+        self.history.push(ChatMessage::user(enriched));
 
         let effective_model = self.classify_model(user_message);
 
-        for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-
-            // Response cache: check before LLM call (only for deterministic, text-only prompts)
-            let cache_key = if self.temperature == 0.0 {
-                self.response_cache.as_ref().map(|_| {
-                    let last_user = messages
-                        .iter()
-                        .rfind(|m| m.role == "user")
-                        .map(|m| m.content.as_str())
-                        .unwrap_or("");
-                    let system = messages
-                        .iter()
-                        .find(|m| m.role == "system")
-                        .map(|m| m.content.as_str());
-                    crate::memory::response_cache::ResponseCache::cache_key(
-                        &effective_model,
-                        system,
-                        last_user,
-                    )
-                })
-            } else {
-                None
-            };
-
-            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
-                if let Ok(Some(cached)) = cache.get(key) {
-                    self.observer.record_event(&ObserverEvent::CacheHit {
-                        cache_type: "response".into(),
-                        tokens_saved: 0,
-                    });
-                    self.history
-                        .push(ConversationMessage::Chat(ChatMessage::assistant(
-                            cached.clone(),
-                        )));
-                    self.trim_history();
-                    return Ok(cached);
-                }
-                self.observer.record_event(&ObserverEvent::CacheMiss {
-                    cache_type: "response".into(),
-                });
-            }
-
-            let response = match self
-                .provider
-                .chat(
-                    ChatRequest {
-                        messages: &messages,
-                        tools: if self.tool_dispatcher.should_send_tool_specs() {
-                            Some(&self.tool_specs)
-                        } else {
-                            None
-                        },
-                    },
+        // Response cache: check before entering the loop
+        let cache_key = if self.temperature == 0.0 {
+            self.response_cache.as_ref().map(|_| {
+                let last_user = self
+                    .history
+                    .iter()
+                    .rfind(|m| m.role == "user")
+                    .map(|m| m.content.as_str())
+                    .unwrap_or("");
+                let system = self
+                    .history
+                    .iter()
+                    .find(|m| m.role == "system")
+                    .map(|m| m.content.as_str());
+                crate::memory::response_cache::ResponseCache::cache_key(
                     &effective_model,
-                    self.temperature,
+                    system,
+                    last_user,
                 )
-                .await
-            {
-                Ok(resp) => resp,
-                Err(err) => return Err(err),
-            };
+            })
+        } else {
+            None
+        };
 
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
-            if calls.is_empty() {
-                let final_text = if text.is_empty() {
-                    response.text.unwrap_or_default()
-                } else {
-                    text
-                };
-
-                // Store in response cache (text-only, no tool calls)
-                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
-                    let token_count = response
-                        .usage
-                        .as_ref()
-                        .and_then(|u| u.output_tokens)
-                        .unwrap_or(0);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
-                }
-
+        if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+            if let Ok(Some(cached)) = cache.get(key) {
+                self.observer.record_event(&ObserverEvent::CacheHit {
+                    cache_type: "response".into(),
+                    tokens_saved: 0,
+                });
                 self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        final_text.clone(),
-                    )));
+                    .push(ChatMessage::assistant(cached.clone()));
                 self.trim_history();
 
-                return Ok(final_text);
-            }
+                if let Some(ref tx) = self.event_sender {
+                    let _ = tx
+                        .send(AgentEvent::Done {
+                            text: cached.clone(),
+                            reasoning_content: None,
+                        })
+                        .await;
+                }
 
-            if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
-                print!("{text}");
-                let _ = std::io::stdout().flush();
+                return Ok(cached);
             }
-
-            self.history.push(ConversationMessage::AssistantToolCalls {
-                text: response.text.clone(),
-                tool_calls: response.tool_calls.clone(),
-                reasoning_content: response.reasoning_content.clone(),
+            self.observer.record_event(&ObserverEvent::CacheMiss {
+                cache_type: "response".into(),
             });
-
-            let results = self.execute_tools(&calls).await;
-            let formatted = self.tool_dispatcher.format_results(&results);
-            self.history.push(formatted);
-            self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
+        let multimodal_config = crate::config::MultimodalConfig::default();
+
+        let LoopOutcome {
+            text,
+            iterations_used,
+        } = run_tool_call_loop(
+            self.provider.as_ref(),
+            &mut self.history,
+            &self.tools,
+            self.observer.as_ref(),
+            &self.provider_name,
+            &effective_model,
+            self.temperature,
+            false,
+            None,
+            "ws",
+            &multimodal_config,
+            self.config.max_tool_iterations,
+            None,
+            None,
+            self.event_sender.clone(),
+            None,
+            &[],
+            &self.config.tool_call_dedup_exempt,
+            None,
         )
+        .await?;
+
+        // Store in response cache if first-round text (no tool calls)
+        if iterations_used == 1 {
+            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                #[allow(clippy::cast_possible_truncation)]
+                let _ = cache.put(key, &effective_model, &text, 0);
+            }
+        }
+
+        self.trim_history();
+        Ok(text)
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
@@ -765,6 +698,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ChatRequest;
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
@@ -892,7 +826,6 @@ mod tests {
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
             .expect("agent builder should succeed with valid config");
@@ -939,7 +872,6 @@ mod tests {
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
             .expect("agent builder should succeed with valid config");
@@ -949,7 +881,7 @@ mod tests {
         assert!(agent
             .history()
             .iter()
-            .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
+            .any(|msg| msg.role == "tool"));
     }
 
     #[tokio::test]
@@ -982,7 +914,6 @@ mod tests {
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .classification_config(crate::config::QueryClassificationConfig {
                 enabled: true,
@@ -1027,7 +958,6 @@ mod tests {
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .allowed_tools(None)
             .build()
@@ -1058,7 +988,6 @@ mod tests {
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .allowed_tools(Some(vec!["nonexistent".to_string()]))
             .build()

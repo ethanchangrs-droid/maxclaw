@@ -89,7 +89,9 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
+use crate::agent::loop_::{
+    build_tool_instructions, run_tool_call_loop, scrub_credentials, LoopOutcome,
+};
 use crate::approval::ApprovalManager;
 use crate::config::Config;
 use crate::identity;
@@ -2176,7 +2178,7 @@ async fn process_channel_message(
     let history_len_before_tools = history.len();
 
     enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
+        Completed(Result<Result<LoopOutcome, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
     }
 
@@ -2201,6 +2203,7 @@ async fn process_channel_message(
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
+                None,
                 ctx.hooks.as_deref(),
                 if msg.channel == "cli" {
                     &[]
@@ -2268,9 +2271,9 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+        LlmExecutionResult::Completed(Ok(Ok(outcome))) => {
             // ── Hook: on_message_sending (modifying) ─────────
-            let mut outbound_response = response;
+            let mut outbound_response = outcome.text;
             if let Some(hooks) = &ctx.hooks {
                 match hooks
                     .run_on_message_sending(

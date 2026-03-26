@@ -9,32 +9,26 @@
 //!   4. Max-iteration bailout
 //!   5. Unknown tool name recovery
 //!   6. Tool execution failure recovery
-//!   7. Parallel tool dispatch
+//!   7. Provider error propagation
 //!   8. History trimming during long conversations
 //!   9. Memory auto-save round-trip
-//!  10. Native vs XML dispatcher integration
+//!  10. Turn integration with XML-formatted response
 //!  11. Empty / whitespace-only LLM responses
 //!  12. Mixed text + tool call responses
 //!  13. Multi-tool batch in a single response
 //!  14. System prompt generation & tool instructions
-//!  15. Context enrichment from memory loader
-//!  16. ConversationMessage serialization round-trip
-//!  17. Tool call with stringified JSON arguments
-//!  18. Conversation history fidelity (tool call → tool result → assistant)
-//!  19. Builder validation (missing required fields)
+//!  15. Conversation history fidelity
+//!  16. Builder validation (missing required fields)
+//!  17. Multi-turn conversation maintains context
+//!  18. Clear history
+//!  19. run_single delegates to turn
 //!  20. Idempotent system prompt insertion
 
 use crate::agent::agent::Agent;
-use crate::agent::dispatcher::{
-    NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
-};
 use crate::config::{AgentConfig, MemoryConfig};
 use crate::memory::{self, Memory};
 use crate::observability::{NoopObserver, Observer};
-use crate::providers::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
-    ToolResultMessage,
-};
+use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall};
 use crate::tools::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -277,14 +271,12 @@ fn make_observer() -> Arc<dyn Observer> {
 fn build_agent_with(
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
-    dispatcher: Box<dyn ToolDispatcher>,
 ) -> Agent {
     Agent::builder()
         .provider(provider)
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
-        .tool_dispatcher(dispatcher)
         .workspace_dir(std::env::temp_dir())
         .build()
         .unwrap()
@@ -301,7 +293,6 @@ fn build_agent_with_memory(
         .tools(tools)
         .memory(mem)
         .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
         .auto_save(auto_save)
         .build()
@@ -318,7 +309,6 @@ fn build_agent_with_config(
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
         .config(config)
         .build()
@@ -364,11 +354,7 @@ fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
 #[tokio::test]
 async fn turn_returns_text_when_no_tools_called() {
     let provider = Box::new(ScriptedProvider::new(vec![text_response("Hello world")]));
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(EchoTool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)]);
 
     let response = agent.turn("hi").await.unwrap();
     assert!(
@@ -392,11 +378,7 @@ async fn turn_executes_single_tool_then_returns() {
         text_response("I ran the tool"),
     ]));
 
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(EchoTool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)]);
 
     let response = agent.turn("run echo").await.unwrap();
     assert!(
@@ -417,26 +399,22 @@ async fn turn_handles_multi_step_tool_chain() {
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "counter".into(),
-            arguments: "{}".into(),
+            arguments: r#"{"step":1}"#.into(),
         }]),
         tool_response(vec![ToolCall {
             id: "tc2".into(),
             name: "counter".into(),
-            arguments: "{}".into(),
+            arguments: r#"{"step":2}"#.into(),
         }]),
         tool_response(vec![ToolCall {
             id: "tc3".into(),
             name: "counter".into(),
-            arguments: "{}".into(),
+            arguments: r#"{"step":3}"#.into(),
         }]),
         text_response("Done after 3 calls"),
     ]));
 
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(counting_tool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(counting_tool)]);
 
     let response = agent.turn("count 3 times").await.unwrap();
     assert!(
@@ -452,14 +430,13 @@ async fn turn_handles_multi_step_tool_chain() {
 
 #[tokio::test]
 async fn turn_bails_out_at_max_iterations() {
-    // Create more tool calls than max_tool_iterations allows.
     let max_iters = 3;
     let mut responses = Vec::new();
     for i in 0..max_iters + 5 {
         responses.push(tool_response(vec![ToolCall {
             id: format!("tc{i}"),
             name: "echo".into(),
-            arguments: r#"{"message": "loop"}"#.into(),
+            arguments: format!(r#"{{"message": "loop-{i}"}}"#),
         }]));
     }
 
@@ -496,11 +473,7 @@ async fn turn_handles_unknown_tool_gracefully() {
         text_response("I couldn't find that tool"),
     ]));
 
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(EchoTool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)]);
 
     let response = agent.turn("use nonexistent").await.unwrap();
     assert!(
@@ -508,16 +481,13 @@ async fn turn_handles_unknown_tool_gracefully() {
         "Expected non-empty response after unknown tool recovery"
     );
 
-    // Verify the tool result mentioned "Unknown tool"
-    let has_tool_result = agent.history().iter().any(|msg| match msg {
-        ConversationMessage::ToolResults(results) => {
-            results.iter().any(|r| r.content.contains("Unknown tool"))
-        }
-        _ => false,
-    });
+    let has_unknown_tool_msg = agent
+        .history()
+        .iter()
+        .any(|msg| msg.content.contains("Unknown tool"));
     assert!(
-        has_tool_result,
-        "Expected tool result with 'Unknown tool' message"
+        has_unknown_tool_msg,
+        "Expected history entry with 'Unknown tool' message"
     );
 }
 
@@ -536,11 +506,7 @@ async fn turn_recovers_from_tool_failure() {
         text_response("Tool failed but I recovered"),
     ]));
 
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(FailingTool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(FailingTool)]);
 
     let response = agent.turn("try failing tool").await.unwrap();
     assert!(
@@ -560,11 +526,7 @@ async fn turn_recovers_from_tool_error() {
         text_response("I recovered from the error"),
     ]));
 
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(PanickingTool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(PanickingTool)]);
 
     let response = agent.turn("try panicking").await.unwrap();
     assert!(
@@ -579,11 +541,7 @@ async fn turn_recovers_from_tool_error() {
 
 #[tokio::test]
 async fn turn_propagates_provider_error() {
-    let mut agent = build_agent_with(
-        Box::new(FailingProvider),
-        vec![],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(Box::new(FailingProvider), vec![]);
 
     let result = agent.turn("hello").await;
     assert!(result.is_err(), "Expected provider error to propagate");
@@ -613,8 +571,6 @@ async fn history_trims_after_max_messages() {
         let _ = agent.turn(&format!("msg {i}")).await.unwrap();
     }
 
-    // System prompt (1) + trimmed messages
-    // Should not exceed max_history + 1 (system prompt)
     assert!(
         agent.history().len() <= max_history + 1,
         "History length {} exceeds max {} + 1 (system)",
@@ -622,9 +578,8 @@ async fn history_trims_after_max_messages() {
         max_history,
     );
 
-    // System prompt should always be preserved
     let first = &agent.history()[0];
-    assert!(matches!(first, ConversationMessage::Chat(c) if c.role == "system"));
+    assert_eq!(first.role, "system", "First history entry should be system prompt");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -647,7 +602,6 @@ async fn auto_save_stores_only_user_messages_in_memory() {
 
     let _ = agent.turn("Remember this fact").await.unwrap();
 
-    // Auto-save only persists user-stated input, never assistant-generated summaries.
     let count = mem.count().await.unwrap();
     assert_eq!(
         count, 1,
@@ -688,49 +642,23 @@ async fn auto_save_disabled_does_not_store() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 10. Native vs XML dispatcher integration
+// 10. Turn integration with XML-formatted response
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn xml_dispatcher_parses_and_loops() {
+async fn xml_formatted_response_completes_turn() {
     let provider = Box::new(ScriptedProvider::new(vec![
         xml_tool_response("echo", r#"{"message": "xml-test"}"#),
         text_response("XML tool completed"),
     ]));
 
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(EchoTool)],
-        Box::new(XmlToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)]);
 
     let response = agent.turn("test xml").await.unwrap();
     assert!(
         !response.is_empty(),
-        "Expected non-empty response from XML dispatcher"
+        "Expected non-empty response from turn"
     );
-}
-
-#[tokio::test]
-async fn native_dispatcher_sends_tool_specs() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(EchoTool)],
-        Box::new(NativeToolDispatcher),
-    );
-
-    let _ = agent.turn("hi").await.unwrap();
-
-    // NativeToolDispatcher.should_send_tool_specs() returns true
-    let dispatcher = NativeToolDispatcher;
-    assert!(dispatcher.should_send_tool_specs());
-}
-
-#[tokio::test]
-async fn xml_dispatcher_does_not_send_tool_specs() {
-    let dispatcher = XmlToolDispatcher;
-    assert!(!dispatcher.should_send_tool_specs());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -746,7 +674,7 @@ async fn turn_handles_empty_text_response() {
         reasoning_content: None,
     }]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(provider, vec![]);
 
     let response = agent.turn("hi").await.unwrap();
     assert!(response.is_empty());
@@ -761,9 +689,8 @@ async fn turn_handles_none_text_response() {
         reasoning_content: None,
     }]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(provider, vec![]);
 
-    // Should not panic — falls back to empty string
     let response = agent.turn("hi").await.unwrap();
     assert!(response.is_empty());
 }
@@ -788,11 +715,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
         text_response("Here are the results"),
     ]));
 
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(EchoTool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)]);
 
     let response = agent.turn("check something").await.unwrap();
     assert!(
@@ -800,11 +723,10 @@ async fn turn_preserves_text_alongside_tool_calls() {
         "Expected non-empty final response after mixed text+tool"
     );
 
-    // The intermediate text should be in history
-    let has_intermediate = agent.history().iter().any(|msg| match msg {
-        ConversationMessage::Chat(c) => c.role == "assistant" && c.content.contains("Let me check"),
-        _ => false,
-    });
+    let has_intermediate = agent
+        .history()
+        .iter()
+        .any(|msg| msg.role == "assistant" && msg.content.contains("Let me check"));
     assert!(has_intermediate, "Intermediate text should be in history");
 }
 
@@ -821,27 +743,23 @@ async fn turn_handles_multiple_tools_in_one_response() {
             ToolCall {
                 id: "tc1".into(),
                 name: "counter".into(),
-                arguments: "{}".into(),
+                arguments: r#"{"batch":1}"#.into(),
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "counter".into(),
-                arguments: "{}".into(),
+                arguments: r#"{"batch":2}"#.into(),
             },
             ToolCall {
                 id: "tc3".into(),
                 name: "counter".into(),
-                arguments: "{}".into(),
+                arguments: r#"{"batch":3}"#.into(),
             },
         ]),
         text_response("All 3 done"),
     ]));
 
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(counting_tool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(counting_tool)]);
 
     let response = agent.turn("batch").await.unwrap();
     assert!(
@@ -862,20 +780,15 @@ async fn turn_handles_multiple_tools_in_one_response() {
 #[tokio::test]
 async fn system_prompt_injected_on_first_turn() {
     let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(EchoTool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)]);
 
     assert!(agent.history().is_empty(), "History should start empty");
 
     let _ = agent.turn("hi").await.unwrap();
 
-    // First message should be the system prompt
     let first = &agent.history()[0];
-    assert!(
-        matches!(first, ConversationMessage::Chat(c) if c.role == "system"),
+    assert_eq!(
+        first.role, "system",
         "First history entry should be system prompt"
     );
 }
@@ -886,11 +799,7 @@ async fn system_prompt_not_duplicated_on_second_turn() {
         text_response("first"),
         text_response("second"),
     ]));
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(EchoTool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)]);
 
     let _ = agent.turn("hi").await.unwrap();
     let _ = agent.turn("hello again").await.unwrap();
@@ -898,7 +807,7 @@ async fn system_prompt_not_duplicated_on_second_turn() {
     let system_count = agent
         .history()
         .iter()
-        .filter(|msg| matches!(msg, ConversationMessage::Chat(c) if c.role == "system"))
+        .filter(|msg| msg.role == "system")
         .count();
     assert_eq!(system_count, 1, "System prompt should appear exactly once");
 }
@@ -918,20 +827,11 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
         text_response("final answer"),
     ]));
 
-    let mut agent = build_agent_with(
-        provider,
-        vec![Box::new(EchoTool)],
-        Box::new(NativeToolDispatcher),
-    );
+    let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)]);
 
     let _ = agent.turn("test").await.unwrap();
 
-    // Expected history entries:
-    //   0: system prompt
-    //   1: user message "test"
-    //   2: AssistantToolCalls
-    //   3: ToolResults
-    //   4: assistant "final answer"
+    // Expected history: system, user, assistant (tool call), tool result(s), assistant (final)
     let history = agent.history();
     assert!(
         history.len() >= 5,
@@ -939,15 +839,19 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
         history.len()
     );
 
-    assert!(matches!(&history[0], ConversationMessage::Chat(c) if c.role == "system"));
-    assert!(matches!(&history[1], ConversationMessage::Chat(c) if c.role == "user"));
-    assert!(matches!(
-        &history[2],
-        ConversationMessage::AssistantToolCalls { .. }
-    ));
-    assert!(matches!(&history[3], ConversationMessage::ToolResults(_)));
+    assert_eq!(history[0].role, "system");
+    assert_eq!(history[1].role, "user");
+    assert_eq!(history[2].role, "assistant");
+    // history[3] is tool result — could be role "tool" or "user" depending on format
     assert!(
-        matches!(&history[4], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "final answer")
+        history[3].role == "tool" || history[3].role == "user",
+        "Expected tool result entry at index 3, got role='{}'",
+        history[3].role
+    );
+    assert_eq!(history[4].role, "assistant");
+    assert!(
+        history[4].content.contains("final answer"),
+        "Last assistant message should contain 'final answer'"
     );
 }
 
@@ -961,7 +865,6 @@ async fn builder_fails_without_provider() {
         .tools(vec![])
         .memory(make_memory())
         .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::path::PathBuf::from("/tmp"))
         .build();
 
@@ -980,7 +883,7 @@ async fn multi_turn_maintains_growing_history() {
         text_response("response 3"),
     ]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(provider, vec![]);
 
     let r1 = agent.turn("msg 1").await.unwrap();
     let len_after_1 = agent.history().len();
@@ -995,7 +898,6 @@ async fn multi_turn_maintains_growing_history() {
     assert_eq!(r2, "response 2");
     assert_eq!(r3, "response 3");
 
-    // History should grow with each turn (user + assistant per turn)
     assert!(
         len_after_2 > len_after_1,
         "History should grow after turn 2"
@@ -1007,299 +909,7 @@ async fn multi_turn_maintains_growing_history() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 18. Tool call with stringified JSON arguments (common LLM pattern)
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn native_dispatcher_handles_stringified_arguments() {
-    let dispatcher = NativeToolDispatcher;
-    let response = ChatResponse {
-        text: Some(String::new()),
-        tool_calls: vec![ToolCall {
-            id: "tc1".into(),
-            name: "echo".into(),
-            arguments: r#"{"message": "hello"}"#.into(),
-        }],
-        usage: None,
-        reasoning_content: None,
-    };
-
-    let (_, calls) = dispatcher.parse_response(&response);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "echo");
-    assert_eq!(
-        calls[0].arguments.get("message").unwrap().as_str().unwrap(),
-        "hello"
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 19. XML dispatcher edge cases
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn xml_dispatcher_handles_nested_json() {
-    let response = ChatResponse {
-        text: Some(
-            r#"<tool_call>
-{"name": "file_write", "arguments": {"path": "test.json", "content": "{\"key\": \"value\"}"}}
-</tool_call>"#
-                .into(),
-        ),
-        tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
-    };
-
-    let dispatcher = XmlToolDispatcher;
-    let (_, calls) = dispatcher.parse_response(&response);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "file_write");
-    assert_eq!(
-        calls[0].arguments.get("path").unwrap().as_str().unwrap(),
-        "test.json"
-    );
-}
-
-#[test]
-fn xml_dispatcher_handles_empty_tool_call_tag() {
-    let response = ChatResponse {
-        text: Some("<tool_call>\n</tool_call>\nSome text".into()),
-        tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
-    };
-
-    let dispatcher = XmlToolDispatcher;
-    let (text, calls) = dispatcher.parse_response(&response);
-    assert!(calls.is_empty());
-    assert!(text.contains("Some text"));
-}
-
-#[test]
-fn xml_dispatcher_handles_unclosed_tool_call() {
-    let response = ChatResponse {
-        text: Some("Before\n<tool_call>\n{\"name\": \"shell\"}".into()),
-        tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
-    };
-
-    let dispatcher = XmlToolDispatcher;
-    let (text, calls) = dispatcher.parse_response(&response);
-    // Should not panic — just treat as text
-    assert!(calls.is_empty());
-    assert!(text.contains("Before"));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 20. ConversationMessage serialization round-trip
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn conversation_message_serialization_roundtrip() {
-    let messages = vec![
-        ConversationMessage::Chat(ChatMessage::system("system")),
-        ConversationMessage::Chat(ChatMessage::user("hello")),
-        ConversationMessage::AssistantToolCalls {
-            text: Some("checking".into()),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "shell".into(),
-                arguments: "{}".into(),
-            }],
-            reasoning_content: None,
-        },
-        ConversationMessage::ToolResults(vec![ToolResultMessage {
-            tool_call_id: "tc1".into(),
-            content: "ok".into(),
-        }]),
-        ConversationMessage::Chat(ChatMessage::assistant("done")),
-    ];
-
-    for msg in &messages {
-        let json = serde_json::to_string(msg).unwrap();
-        let parsed: ConversationMessage = serde_json::from_str(&json).unwrap();
-
-        // Verify the variant type matches
-        match (msg, &parsed) {
-            (ConversationMessage::Chat(a), ConversationMessage::Chat(b)) => {
-                assert_eq!(a.role, b.role);
-                assert_eq!(a.content, b.content);
-            }
-            (
-                ConversationMessage::AssistantToolCalls {
-                    text: a_text,
-                    tool_calls: a_calls,
-                    ..
-                },
-                ConversationMessage::AssistantToolCalls {
-                    text: b_text,
-                    tool_calls: b_calls,
-                    ..
-                },
-            ) => {
-                assert_eq!(a_text, b_text);
-                assert_eq!(a_calls.len(), b_calls.len());
-            }
-            (ConversationMessage::ToolResults(a), ConversationMessage::ToolResults(b)) => {
-                assert_eq!(a.len(), b.len());
-            }
-            _ => panic!("Variant mismatch after serialization"),
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 21. Tool dispatcher format_results
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn xml_format_results_includes_status_and_output() {
-    let dispatcher = XmlToolDispatcher;
-    let results = vec![
-        ToolExecutionResult {
-            name: "shell".into(),
-            output: "file1.txt\nfile2.txt".into(),
-            success: true,
-            tool_call_id: None,
-        },
-        ToolExecutionResult {
-            name: "file_read".into(),
-            output: "Error: file not found".into(),
-            success: false,
-            tool_call_id: None,
-        },
-    ];
-
-    let msg = dispatcher.format_results(&results);
-    let content = match msg {
-        ConversationMessage::Chat(c) => c.content,
-        _ => panic!("Expected Chat variant"),
-    };
-
-    assert!(content.contains("shell"));
-    assert!(content.contains("file1.txt"));
-    assert!(content.contains("ok"));
-    assert!(content.contains("file_read"));
-    assert!(content.contains("error"));
-}
-
-#[test]
-fn native_format_results_maps_tool_call_ids() {
-    let dispatcher = NativeToolDispatcher;
-    let results = vec![
-        ToolExecutionResult {
-            name: "a".into(),
-            output: "out1".into(),
-            success: true,
-            tool_call_id: Some("tc-001".into()),
-        },
-        ToolExecutionResult {
-            name: "b".into(),
-            output: "out2".into(),
-            success: true,
-            tool_call_id: Some("tc-002".into()),
-        },
-    ];
-
-    let msg = dispatcher.format_results(&results);
-    match msg {
-        ConversationMessage::ToolResults(r) => {
-            assert_eq!(r.len(), 2);
-            assert_eq!(r[0].tool_call_id, "tc-001");
-            assert_eq!(r[0].content, "out1");
-            assert_eq!(r[1].tool_call_id, "tc-002");
-            assert_eq!(r[1].content, "out2");
-        }
-        _ => panic!("Expected ToolResults"),
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 22. to_provider_messages conversion
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn xml_dispatcher_converts_history_to_provider_messages() {
-    let dispatcher = XmlToolDispatcher;
-    let history = vec![
-        ConversationMessage::Chat(ChatMessage::system("sys")),
-        ConversationMessage::Chat(ChatMessage::user("hi")),
-        ConversationMessage::AssistantToolCalls {
-            text: Some("checking".into()),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "shell".into(),
-                arguments: "{}".into(),
-            }],
-            reasoning_content: None,
-        },
-        ConversationMessage::ToolResults(vec![ToolResultMessage {
-            tool_call_id: "tc1".into(),
-            content: "ok".into(),
-        }]),
-        ConversationMessage::Chat(ChatMessage::assistant("done")),
-    ];
-
-    let messages = dispatcher.to_provider_messages(&history);
-
-    // Should have: system, user, assistant (from tool calls), user (tool results), assistant
-    assert!(messages.len() >= 4);
-    assert_eq!(messages[0].role, "system");
-    assert_eq!(messages[1].role, "user");
-}
-
-#[test]
-fn native_dispatcher_converts_tool_results_to_tool_messages() {
-    let dispatcher = NativeToolDispatcher;
-    let history = vec![ConversationMessage::ToolResults(vec![
-        ToolResultMessage {
-            tool_call_id: "tc1".into(),
-            content: "output1".into(),
-        },
-        ToolResultMessage {
-            tool_call_id: "tc2".into(),
-            content: "output2".into(),
-        },
-    ])];
-
-    let messages = dispatcher.to_provider_messages(&history);
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].role, "tool");
-    assert_eq!(messages[1].role, "tool");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 23. XML tool instructions generation
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn xml_dispatcher_generates_tool_instructions() {
-    let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let dispatcher = XmlToolDispatcher;
-    let instructions = dispatcher.prompt_instructions(&tools);
-
-    assert!(instructions.contains("## Tool Use Protocol"));
-    assert!(instructions.contains("<tool_call>"));
-    // Tool listing is handled by ToolsSection in prompt.rs, not by the
-    // dispatcher.  prompt_instructions() must only emit the protocol envelope.
-    assert!(
-        !instructions.contains("echo"),
-        "dispatcher should not duplicate tool listing"
-    );
-}
-
-#[test]
-fn native_dispatcher_returns_empty_instructions() {
-    let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let dispatcher = NativeToolDispatcher;
-    let instructions = dispatcher.prompt_instructions(&tools);
-    assert!(instructions.is_empty());
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 24. Clear history
+// 18. Clear history
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -1309,7 +919,7 @@ async fn clear_history_resets_conversation() {
         text_response("second"),
     ]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(provider, vec![]);
 
     let _ = agent.turn("hi").await.unwrap();
     assert!(!agent.history().is_empty());
@@ -1317,22 +927,21 @@ async fn clear_history_resets_conversation() {
     agent.clear_history();
     assert!(agent.history().is_empty());
 
-    // Next turn should re-inject system prompt
     let _ = agent.turn("hello again").await.unwrap();
-    assert!(matches!(
-        &agent.history()[0],
-        ConversationMessage::Chat(c) if c.role == "system"
-    ));
+    assert_eq!(
+        agent.history()[0].role, "system",
+        "First entry after clear should be system prompt"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 25. run_single delegates to turn
+// 19. run_single delegates to turn
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
 async fn run_single_delegates_to_turn() {
     let provider = Box::new(ScriptedProvider::new(vec![text_response("via run_single")]));
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(provider, vec![]);
 
     let response = agent.run_single("test").await.unwrap();
     assert!(

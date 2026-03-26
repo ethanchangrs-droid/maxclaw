@@ -769,7 +769,6 @@ mod tests {
     #[tokio::test]
     async fn e2e_agent_file_read_pdf_extraction() {
         use crate::agent::agent::Agent;
-        use crate::agent::dispatcher::NativeToolDispatcher;
         use crate::providers::{ChatResponse, Provider, ToolCall};
         use e2e_helpers::*;
 
@@ -794,7 +793,6 @@ mod tests {
 
         // ── Script provider: call file_read → then answer ──
         let (provider, recorded) = RecordingProvider::new(vec![
-            // Turn 1 response: provider asks to read the PDF
             ChatResponse {
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
@@ -805,7 +803,6 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
             },
-            // Turn 1 continued: provider sees tool result and answers
             ChatResponse {
                 text: Some("The PDF contains a greeting: Hello PDF".into()),
                 tool_calls: vec![],
@@ -819,7 +816,6 @@ mod tests {
             .tools(vec![file_read_tool])
             .memory(make_memory())
             .observer(make_observer())
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(workspace.clone())
             .build()
             .unwrap();
@@ -866,7 +862,6 @@ mod tests {
     #[tokio::test]
     async fn e2e_agent_file_read_lossy_binary() {
         use crate::agent::agent::Agent;
-        use crate::agent::dispatcher::NativeToolDispatcher;
         use crate::providers::{ChatResponse, Provider, ToolCall};
         use e2e_helpers::*;
 
@@ -911,7 +906,6 @@ mod tests {
             .tools(vec![file_read_tool])
             .memory(make_memory())
             .observer(make_observer())
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(workspace.clone())
             .build()
             .unwrap();
@@ -961,7 +955,6 @@ mod tests {
     #[ignore = "requires valid OpenAI Codex OAuth credentials"]
     async fn e2e_live_file_read_pdf() {
         use crate::agent::agent::Agent;
-        use crate::agent::dispatcher::XmlToolDispatcher;
         use crate::providers::openai_codex::OpenAiCodexProvider;
         use crate::providers::{Provider, ProviderRuntimeOptions};
         use e2e_helpers::*;
@@ -985,7 +978,6 @@ mod tests {
         });
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
-        // ── Real provider (OpenAI Codex uses XML tool dispatch) ──
         let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default(), None)
             .expect("provider should initialize");
 
@@ -994,7 +986,6 @@ mod tests {
             .tools(vec![file_read_tool])
             .memory(make_memory())
             .observer(make_observer())
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
             .workspace_dir(workspace.clone())
             .model_name("gpt-5.3-codex".to_string())
             .build()
