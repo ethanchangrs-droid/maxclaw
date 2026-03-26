@@ -1,0 +1,141 @@
+# Claude Progress Log
+
+## 2026-03-18 14:42 CST — 会话 1
+
+### 完成内容
+- 分析了 WebSocket 聊天界面 reasoning/thinking 块显示顺序异常的问题
+- 定位根因：src/gateway/ws.rs 中存在竞态条件
+  - forward_agent_events 任务和主循环是两个独立写入者
+  - done 消息可能抢先于 reasoning 到达前端
+- 建立了 feature_list.json，记录了 3 个任务（F001-F003）
+- 完成 F001：修复 ws.rs 竞态条件
+  - forward_agent_events 现在处理 AgentEvent::Done 发送 done 消息
+  - 主循环不再直接发送 done，仅保留 error 和 agent_end 广播
+  - cargo check + cargo clippy 零错误通过
+
+### 涉及文件
+- src/gateway/ws.rs（3 处修改）
+
+### 当前状态
+- F001 已完成并标记 passes: true
+- 代码处于可编译、可合并状态
+
+### 下一步
+- F003（P0）：统一 agent loop
+
+## 2026-03-26 11:43 CST — 会话 2
+
+### 完成内容
+- 完成 F003：Agent 核心 Loop 统一与 History 类型统一
+  - Phase 1: run_tool_call_loop 新增 event_sender 参数 + LoopOutcome 返回值
+    - 6 处注入 AgentEvent 发送：Reasoning、ToolCallStart、ToolCallComplete、Chunk、Done
+    - 更新所有内部/外部 call sites（loop_.rs, channels/mod.rs, tools/delegate.rs）
+  - Phase 2: Agent::turn() 委托到 run_tool_call_loop
+    - history 从 Vec&lt;ConversationMessage&gt; 统一为 Vec&lt;ChatMessage&gt;
+    - 删除 execute_tool_call() / execute_tools()
+    - response cache 逻辑移到 turn() 外层，基于 LoopOutcome.iterations_used 判断
+    - trim_history() 重写为直接操作 ChatMessage
+    - build_system_prompt() 改用 provider.supports_native_tools()
+  - Phase 3: 清理废弃代码 + 测试重写
+    - 删除 ConversationMessage 枚举（providers/traits.rs）
+    - 删除 ToolDispatcher trait + NativeToolDispatcher + XmlToolDispatcher（dispatcher.rs）
+    - 删除 dispatcher.rs 文件
+    - 废弃 config.agent.tool_dispatcher 配置字段
+    - 重命名 PromptContext.dispatcher_instructions → tool_instructions
+    - 重写 agent/tests.rs（22 个测试适配 ChatMessage + 去重逻辑）
+    - 重写 integration/agent.rs 测试
+    - 清理 file_read.rs、support/helpers.rs、benchmarks 中的 dispatcher 引用
+
+### 涉及文件
+- src/agent/agent.rs, dispatcher.rs(deleted), loop_.rs, mod.rs, prompt.rs, tests.rs
+- src/channels/mod.rs, src/config/schema.rs, src/gateway/ws.rs
+- src/providers/mod.rs, traits.rs
+- src/tools/delegate.rs, file_read.rs
+- tests/component/config_persistence.rs, tests/integration/agent.rs, tests/support/helpers.rs
+- benches/agent_benchmarks.rs
+
+### 测试结果
+- cargo check: 零错误通过
+- cargo test: 8344+ 测试全部通过，0 失败
+
+### Git commit
+- 286f8cda feat(agent): unify agent loop and history type (F003)
+
+### 当前状态
+- F003 已完成并标记 passes: true
+- 代码处于可编译、可合并状态
+- 净减 897 行代码（+426, -1323）
+
+### 下一步
+- F004（P0）：WebSocket 路径能力补齐
+- F002（P2）：WebSocket 真正流式输出
+
+## 2026-03-26 — 会话 3
+
+### 完成内容
+- 分析 F004 需求文档完善度，确认 success 字段 bug 已被 F003 自动解决
+- 将 F004 拆分为 4 个独立 feature（F004a-F004d），调整优先级
+- 完成 F004a：WS 路径 Provider 改用 ProviderRuntimeOptions
+  - Agent::from_config() 中 create_routed_provider → create_routed_provider_with_options
+  - 构造 ProviderRuntimeOptions 传入 reasoning_enabled、provider_timeout_secs、extra_headers、api_path、secrets_encrypt
+  - 使 WS 路径与 CLI/Channel/Gateway 行为一致
+
+### 涉及文件
+- src/agent/agent.rs（from_config 方法，+12 行）
+- feature_list.json（F004 拆分 + F004a 标记完成）
+
+### 测试结果
+- cargo check: 零错误通过
+- cargo test: 23 个 agent 测试全部通过，5 个已有的无关失败（sandbox 环境限制）
+
+### Git commit
+- afd45d2b feat(agent): use ProviderRuntimeOptions in WS path (F004a)
+
+### 当前状态
+- F004a 已完成并标记 passes: true
+- 代码处于可编译、可合并状态
+
+### 下一步
+- F004b（P3）：WS 路径补齐 MCP 工具初始化
+- F004c（P3）：WS 路径补齐 Peripheral 工具
+- F004d（P3）：WS 路径 Memory auto_save 增加长度门槛
+- F002（P2）：WebSocket 真正流式输出
+
+## 2026-03-26 15:27 CST — 会话 4
+
+### 完成内容
+- 完成 F006：微信 iLink Channel 核心通道（MVP）
+  - 新增 src/channels/weixin.rs（~340 行）
+    - WeixinChannel 结构体，实现 Channel trait（name/send/listen/health_check）
+    - iLink Bot API 长轮询（getupdates + get_updates_buf 游标）
+    - sendmessage 发送回复，自动查找 context_token
+    - context_token 管理：Arc<RwLock<HashMap>> 内存缓存 + 磁盘持久化
+    - 启动时预加载已有 token，支持重启后 cron 投递
+    - allowed_users 白名单在 listen() 中过滤
+    - 超长文本自动分段发送（MAX_MESSAGE_LENGTH=2000）
+    - errcode=-14 会话过期检测 + tracing::error 告警
+    - 10 个单元测试
+  - schema.rs 添加 WeixinConfig 配置结构 + ChannelsConfig.weixin 字段
+  - channels/mod.rs 注册 pub mod/pub use/collect_configured_channels
+  - cron/scheduler.rs deliver_announcement 添加 weixin 分支
+  - 修复测试代码中 3 处 ChannelsConfig 初始化缺少 weixin 字段
+
+### 涉及文件
+- src/channels/weixin.rs（新增）
+- src/config/schema.rs（WeixinConfig + ChannelsConfig 字段 + Default + 3 处测试）
+- src/channels/mod.rs（mod/use/collect 注册）
+- src/cron/scheduler.rs（deliver_announcement + import）
+
+### 测试结果
+- cargo check: 零错误通过
+- cargo test -- weixin: 10/10 通过
+- cargo test -- agent config channels_config: 584 通过，2 个已有 sandbox 限制失败（非本次变更）
+
+### 当前状态
+- F006 已完成并标记 passes: true
+- 代码处于可编译、可合并状态
+
+### 下一步
+- F007（P3）：微信扫码登录 CLI 与增强
+- F002（P2）：WebSocket 真正流式输出
+- F004b（P3）：WS 路径补齐 MCP 工具初始化

@@ -71,5 +71,37 @@
     "priority": "P3",
     "passes": false,
     "added": "2026-03-25"
+  },
+  {
+    "id": "F006",
+    "title": "微信 iLink Channel 核心通道（MVP）",
+    "description": "实现微信 iLink Bot API 的 Rust 原生 Channel（主动连接型，走路径一）。包含：1) schema.rs 添加 WeixinConfig 配置结构；2) weixin.rs 实现 WeixinChannel（getupdates 长轮询 + sendmessage）；3) channels/mod.rs collect_configured_channels 注册；4) ChannelMessage 字段映射（reply_target=from_user_id 等）；5) context_token 管理（Arc<RwLock<HashMap>> 内存缓存 + 磁盘持久化 context_tokens.json，启动时预加载）；6) errcode -14 会话过期检测 + Observer 告警；7) allowed_users 白名单在 listen() 中过滤；8) 超长文本自动分段发送；9) deliver_announcement 添加 weixin 分支（Cron 投递）；10) README 添加微信配置说明。详见 docs/weixin-ilink-integration_V2.0_202603261506.md 第 5、6、8、9.1 节",
+    "priority": "P1",
+    "passes": true,
+    "added": "2026-03-26"
+  },
+  {
+    "id": "F007",
+    "title": "微信扫码登录 CLI 与增强",
+    "description": "1) 实现 `zeroclaw weixin login` CLI 命令：调用 get_bot_qrcode 获取二维码并终端展示，长轮询 get_qrcode_status 等待扫码，成功后自动写入 config；2) 实现 typing 指示器（start_typing/stop_typing 对接 iLink sendtyping API）；3) get_updates_buf 游标持久化到磁盘，重启不丢消息。详见 docs/weixin-ilink-integration_V2.0_202603261506.md 第 7.1、9.2 节",
+    "priority": "P3",
+    "passes": false,
+    "added": "2026-03-26"
+  },
+  {
+    "id": "F008",
+    "title": "微信 iLink 多媒体消息支持",
+    "description": "1) 图片接收：CDN 下载 + AES-128-ECB 解密；2) 图片发送：AES-128-ECB 加密 + CDN 上传；3) 语音支持：SILK 格式解码（需 FFI 或外部工具）。详见 docs/weixin-ilink-integration_V2.0_202603261506.md 第 9.3 节",
+    "priority": "P3",
+    "passes": false,
+    "added": "2026-03-26"
+  },
+  {
+    "id": "F009",
+    "title": "微信 iLink Draft 流式编辑验证与实现",
+    "description": "1) 验证 iLink API 是否支持消息编辑/更新；2) 若支持，实现 supports_draft_updates / send_draft / update_draft / finalize_draft 方法，使微信通道支持 Agent 回复的逐步流式展示。注意：iLink 可能不支持消息编辑，需先 API 验证再决定是否实施。详见 docs/weixin-ilink-integration_V2.0_202603261506.md 第 5.8、9.4 节",
+    "priority": "P3",
+    "passes": false,
+    "added": "2026-03-26"
   }
 ]

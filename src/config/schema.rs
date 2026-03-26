@@ -4159,6 +4159,8 @@ pub struct ChannelsConfig {
     pub reddit: Option<RedditConfig>,
     /// Bluesky channel configuration (AT Protocol).
     pub bluesky: Option<BlueskyConfig>,
+    /// WeChat personal account channel via iLink Bot API (long-polling).
+    pub weixin: Option<WeixinConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -4333,6 +4335,7 @@ impl Default for ChannelsConfig {
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            weixin: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: true,
@@ -5346,6 +5349,22 @@ impl ChannelConfig for WeComConfig {
     fn desc() -> &'static str {
         "WeCom Bot Webhook"
     }
+}
+
+/// WeChat personal account channel via iLink Bot HTTP API.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WeixinConfig {
+    /// iLink Bot Token obtained via QR code login.
+    pub bot_token: String,
+    /// iLink API base URL. Defaults to `https://ilinkai.weixin.qq.com`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Allowed user IDs. Empty = allow all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Long-poll timeout in milliseconds. Default: 35000.
+    #[serde(default)]
+    pub poll_timeout_ms: Option<u64>,
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
@@ -8242,6 +8261,7 @@ default_temperature = 0.7
                 clawdtalk: None,
                 reddit: None,
                 bluesky: None,
+                weixin: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -8990,6 +9010,7 @@ allowed_users = ["@ops:matrix.org"]
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            weixin: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -9236,6 +9257,7 @@ channel_id = "C123"
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            weixin: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,

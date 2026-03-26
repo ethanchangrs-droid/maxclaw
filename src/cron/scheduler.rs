@@ -2,7 +2,7 @@
 use crate::channels::MatrixChannel;
 use crate::channels::{
     Channel, DiscordChannel, MattermostChannel, SendMessage, SignalChannel, SlackChannel,
-    TelegramChannel,
+    TelegramChannel, WeixinChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -431,6 +431,21 @@ pub(crate) async fn deliver_announcement(
             {
                 anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
             }
+        }
+        "weixin" => {
+            let wx = config
+                .channels_config
+                .weixin
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("weixin channel not configured"))?;
+            let channel = WeixinChannel::new(
+                wx.bot_token.clone(),
+                wx.base_url.clone(),
+                wx.allowed_users.clone(),
+                wx.poll_timeout_ms,
+                Some(config.workspace_dir.as_ref()),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }

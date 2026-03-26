@@ -48,6 +48,7 @@ pub mod twitter;
 pub mod wati;
 pub mod webhook;
 pub mod wecom;
+pub mod weixin;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -85,6 +86,7 @@ pub use twitter::TwitterChannel;
 pub use wati::WatiChannel;
 pub use webhook::WebhookChannel;
 pub use wecom::WeComChannel;
+pub use weixin::WeixinChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
@@ -3591,6 +3593,19 @@ fn collect_configured_channels(
             channel: Arc::new(WeComChannel::new(
                 wc.webhook_key.clone(),
                 wc.allowed_users.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref wx) = config.channels_config.weixin {
+        channels.push(ConfiguredChannel {
+            display_name: "WeiXin",
+            channel: Arc::new(WeixinChannel::new(
+                wx.bot_token.clone(),
+                wx.base_url.clone(),
+                wx.allowed_users.clone(),
+                wx.poll_timeout_ms,
+                Some(config.workspace_dir.as_ref()),
             )),
         });
     }
