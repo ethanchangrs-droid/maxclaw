@@ -85,7 +85,7 @@
     "title": "微信扫码登录 CLI 与增强",
     "description": "1) 实现 `zeroclaw weixin login` CLI 命令：调用 get_bot_qrcode 获取二维码并终端展示，长轮询 get_qrcode_status 等待扫码，成功后自动写入 config；2) 实现 typing 指示器（start_typing/stop_typing 对接 iLink sendtyping API）；3) get_updates_buf 游标持久化到磁盘，重启不丢消息。详见 docs/weixin-ilink-integration_V2.0_202603261506.md 第 7.1、9.2 节",
     "priority": "P3",
-    "passes": false,
+    "passes": true,
     "added": "2026-03-26"
   },
   {

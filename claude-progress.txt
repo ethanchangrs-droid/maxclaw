@@ -139,3 +139,48 @@
 - F007（P3）：微信扫码登录 CLI 与增强
 - F002（P2）：WebSocket 真正流式输出
 - F004b（P3）：WS 路径补齐 MCP 工具初始化
+
+## 2026-03-26 15:50 CST — 会话 5
+
+### 完成内容
+- 完成 F007：微信扫码登录 CLI 与增强
+  - 新增 `zeroclaw weixin login` CLI 命令（src/main.rs）
+    - WeixinCommands 枚举 + Commands::Weixin 变体
+    - get_bot_qrcode API 获取二维码，qrcode crate 终端渲染（Dense1x2）
+    - 长轮询 get_qrcode_status（3 秒间隔，120 秒超时）
+    - 成功后自动写入 config.toml（channels_config.weixin）
+    - 无 channel-weixin feature 时降级为打印 URL
+  - 实现 typing 指示器（src/channels/weixin.rs）
+    - WeixinChannel 新增 typing_handle: Mutex&lt;Option&lt;JoinHandle>>
+    - start_typing: 查找 context_token → spawn 循环 POST sendtyping（4 秒）
+    - stop_typing: abort handle（与 Telegram/Discord 同模式）
+    - 无 context_token 时静默跳过
+  - 实现 get_updates_buf 游标持久化
+    - 新增 cursor_store_path 字段 + save_cursor/load_cursor 方法
+    - listen() 启动时从磁盘加载，poll 成功后异步写入
+    - 重启不丢消息
+  - Cargo.toml 新增 channel-weixin feature 启用 qrcode dep
+  - 4 个新单元测试
+
+### 涉及文件
+- Cargo.toml（+1 行 feature）
+- src/main.rs（+211 行：WeixinCommands + handle_weixin_command + weixin_login）
+- src/channels/weixin.rs（+167 行：typing + cursor + tests）
+
+### 测试结果
+- cargo check: 零错误通过
+- cargo test -- weixin: 28/28 通过（lib 14 + main 14）
+- cargo test -- agent config channels_config: 584 通过，2 个已有 sandbox 限制失败（非本次变更）
+
+### Git commit
+- 6f2c34f5 feat(channels): add WeChat QR login CLI, typing indicator, and cursor persistence (F007)
+
+### 当前状态
+- F007 已完成并标记 passes: true
+- 代码处于可编译、可合并状态
+
+### 下一步
+- F002（P2）：WebSocket 真正流式输出
+- F004b（P3）：WS 路径补齐 MCP 工具初始化
+- F004c（P3）：WS 路径补齐 Peripheral 工具
+- F004d（P3）：WS 路径 Memory auto_save 增加长度门槛
