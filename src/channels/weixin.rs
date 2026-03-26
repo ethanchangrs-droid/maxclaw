@@ -259,24 +259,38 @@ impl WeixinChannel {
         }
     }
 
-    async fn send_typing_request(
+    async fn get_typing_ticket(
         &self,
         to: &str,
         context_token: &str,
-    ) -> anyhow::Result<()> {
-        let url = format!("{}/ilink/bot/sendtyping", self.base_url);
-        let _ = self
+    ) -> anyhow::Result<Option<String>> {
+        let url = format!("{}/ilink/bot/getconfig", self.base_url);
+
+        #[derive(serde::Deserialize)]
+        struct ConfigResp {
+            #[serde(default)]
+            typing_ticket: Option<String>,
+        }
+
+        let resp = self
             .http_client()
             .post(&url)
             .headers(self.build_headers())
             .json(&serde_json::json!({
                 "to_user_id": to,
                 "context_token": context_token,
+                "base_info": { "channel_version": "2.0.0" }
             }))
             .timeout(std::time::Duration::from_secs(10))
             .send()
-            .await;
-        Ok(())
+            .await?;
+
+        if resp.status().is_success() {
+            if let Ok(data) = resp.json::<ConfigResp>().await {
+                return Ok(data.typing_ticket);
+            }
+        }
+        Ok(None)
     }
 
     async fn save_cursor(&self, cursor: &str) {
@@ -487,24 +501,58 @@ impl Channel for WeixinChannel {
             }
         };
 
+        let typing_ticket = self
+            .get_typing_ticket(recipient, &context_token)
+            .await
+            .unwrap_or(None);
+
+        let typing_ticket = match typing_ticket {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                tracing::debug!(
+                    "WeiXin: no typing_ticket for {recipient}, skipping typing indicator"
+                );
+                return Ok(());
+            }
+        };
+
         let client = self.http_client();
         let headers = self.build_headers();
         let url = format!("{}/ilink/bot/sendtyping", self.base_url);
         let user_id = recipient.to_string();
+        let ctx_token = context_token;
 
         let handle = tokio::spawn(async move {
+            // status=1 starts typing, status=2 stops
+            let _ = client
+                .post(&url)
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "to_user_id": &user_id,
+                    "context_token": &ctx_token,
+                    "typing_ticket": &typing_ticket,
+                    "status": 1,
+                    "base_info": { "channel_version": "2.0.0" }
+                }))
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await;
+
             loop {
+                tokio::time::sleep(std::time::Duration::from_secs(TYPING_INTERVAL_SECS)).await;
                 let _ = client
                     .post(&url)
                     .headers(headers.clone())
                     .json(&serde_json::json!({
                         "to_user_id": &user_id,
-                        "context_token": &context_token,
+                        "context_token": &ctx_token,
+                        "typing_ticket": &typing_ticket,
+                        "status": 1,
+                        "base_info": { "channel_version": "2.0.0" }
                     }))
                     .timeout(std::time::Duration::from_secs(10))
                     .send()
                     .await;
-                tokio::time::sleep(std::time::Duration::from_secs(TYPING_INTERVAL_SECS)).await;
             }
         });
 

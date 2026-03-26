@@ -1280,8 +1280,7 @@ async fn handle_weixin_command(weixin_command: WeixinCommands, mut config: Confi
 }
 
 const WEIXIN_ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
-const WEIXIN_LOGIN_POLL_INTERVAL_SECS: u64 = 3;
-const WEIXIN_LOGIN_TIMEOUT_SECS: u64 = 120;
+const WEIXIN_LOGIN_TIMEOUT_SECS: u64 = 300;
 
 async fn weixin_login(config: &mut Config) -> Result<()> {
     println!("WeChat iLink QR Code Login");
@@ -1289,13 +1288,11 @@ async fn weixin_login(config: &mut Config) -> Result<()> {
     println!();
 
     let client = reqwest::Client::new();
-    let url = format!("{WEIXIN_ILINK_BASE_URL}/ilink/bot/get_bot_qrcode");
+    let url = format!("{WEIXIN_ILINK_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3");
 
     println!("Fetching QR code from iLink API...");
     let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({}))
+        .get(&url)
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
@@ -1310,27 +1307,27 @@ async fn weixin_login(config: &mut Config) -> Result<()> {
     #[derive(Deserialize)]
     struct QrCodeResp {
         #[serde(default)]
-        errcode: i64,
+        ret: i64,
         #[serde(default)]
-        errmsg: Option<String>,
+        err_msg: Option<String>,
         #[serde(default)]
-        qrcode_url: String,
+        qrcode: String,
         #[serde(default)]
-        uuid: String,
+        qrcode_img_content: String,
     }
 
     let qr_resp: QrCodeResp = resp.json().await.context("Failed to parse QR code response")?;
-    if qr_resp.errcode != 0 {
-        let msg = qr_resp.errmsg.as_deref().unwrap_or("unknown");
-        bail!("iLink get_bot_qrcode errcode={}: {msg}", qr_resp.errcode);
+    if qr_resp.ret != 0 {
+        let msg = qr_resp.err_msg.as_deref().unwrap_or("unknown");
+        bail!("iLink get_bot_qrcode ret={}: {msg}", qr_resp.ret);
     }
-    if qr_resp.qrcode_url.is_empty() {
-        bail!("iLink returned empty qrcode_url");
+    if qr_resp.qrcode.is_empty() {
+        bail!("iLink returned empty qrcode");
     }
 
     #[cfg(feature = "channel-weixin")]
     {
-        let qr = qrcode::QrCode::new(qr_resp.qrcode_url.as_bytes())
+        let qr = qrcode::QrCode::new(qr_resp.qrcode_img_content.as_bytes())
             .map_err(|e| anyhow::anyhow!("Failed to encode QR code: {e}"))?;
         let rendered = qr
             .render::<qrcode::render::unicode::Dense1x2>()
@@ -1342,7 +1339,7 @@ async fn weixin_login(config: &mut Config) -> Result<()> {
     #[cfg(not(feature = "channel-weixin"))]
     {
         println!("QR code URL (scan with WeChat):");
-        println!("  {}", qr_resp.qrcode_url);
+        println!("  {}", qr_resp.qrcode_img_content);
         println!();
         println!(
             "Note: Build with `--features channel-weixin` to display QR code in terminal."
@@ -1353,7 +1350,6 @@ async fn weixin_login(config: &mut Config) -> Result<()> {
     println!("Scan the QR code with WeChat...");
     println!("Waiting for login (timeout: {WEIXIN_LOGIN_TIMEOUT_SECS}s)");
 
-    let poll_url = format!("{WEIXIN_ILINK_BASE_URL}/ilink/bot/get_qrcode_status");
     let started = std::time::Instant::now();
 
     loop {
@@ -1363,16 +1359,14 @@ async fn weixin_login(config: &mut Config) -> Result<()> {
             );
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(
-            WEIXIN_LOGIN_POLL_INTERVAL_SECS,
-        ))
-        .await;
+        let poll_url = format!(
+            "{WEIXIN_ILINK_BASE_URL}/ilink/bot/get_qrcode_status?qrcode={}",
+            qr_resp.qrcode
+        );
 
         let poll_resp = client
-            .post(&poll_url)
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({ "uuid": &qr_resp.uuid }))
-            .timeout(std::time::Duration::from_secs(10))
+            .get(&poll_url)
+            .timeout(std::time::Duration::from_secs(35))
             .send()
             .await;
 
@@ -1391,11 +1385,13 @@ async fn weixin_login(config: &mut Config) -> Result<()> {
         #[derive(Deserialize)]
         struct StatusResp {
             #[serde(default)]
-            errcode: i64,
+            ret: i64,
             #[serde(default)]
-            status: i32,
+            status: String,
             #[serde(default)]
             bot_token: Option<String>,
+            #[serde(default)]
+            baseurl: Option<String>,
         }
 
         let status: StatusResp = match poll_resp.json().await {
@@ -1403,31 +1399,28 @@ async fn weixin_login(config: &mut Config) -> Result<()> {
             Err(_) => continue,
         };
 
-        if status.errcode != 0 {
-            tracing::debug!("Poll errcode={}", status.errcode);
+        if status.ret != 0 {
+            tracing::debug!("Poll ret={}", status.ret);
             continue;
         }
 
-        // status: 0=pending, 1=scanned, 2=confirmed
-        match status.status {
-            0 => {
-                print!(".");
-                let _ = std::io::stdout().flush();
-            }
-            1 => {
-                println!();
+        match status.status.as_str() {
+            "wait" => {}
+            "scaned" => {
                 println!("QR code scanned! Waiting for confirmation...");
             }
-            2 => {
+            "confirmed" => {
                 println!();
                 let token = status
                     .bot_token
                     .filter(|t| !t.is_empty())
                     .context("Login confirmed but no bot_token received")?;
 
+                let base_url = status.baseurl.filter(|u| !u.is_empty());
+
                 let weixin_cfg = config::schema::WeixinConfig {
                     bot_token: token,
-                    base_url: None,
+                    base_url,
                     allowed_users: vec![],
                     poll_timeout_ms: None,
                 };
@@ -1440,6 +1433,9 @@ async fn weixin_login(config: &mut Config) -> Result<()> {
                 println!("  docker compose restart");
                 println!("  # or: zeroclaw daemon");
                 return Ok(());
+            }
+            "expired" => {
+                bail!("QR code expired. Please try again.");
             }
             other => {
                 tracing::debug!("Unknown poll status: {other}");
