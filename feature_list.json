@@ -1,0 +1,75 @@
+[
+  {
+    "id": "F001",
+    "title": "WebSocket reasoning/done 消息顺序竞态修复",
+    "description": "ws.rs 中 forward_agent_events 和主循环是两个独立写入者，done 消息可能抢先于 reasoning 到达前端。修复方案：让 forward_agent_events 处理 AgentEvent::Done 发送 done 消息，主循环不再直接发送。",
+    "priority": "P0",
+    "passes": true,
+    "added": "2026-03-18"
+  },
+  {
+    "id": "F002",
+    "title": "WebSocket 真正流式输出（Provider SSE 级别）",
+    "description": "当前 agent loop 使用 provider.chat() 阻塞等待完整响应后才输出，用户体验为长时间空白等待后一次性显示。需要接通 Provider trait 的 stream_chat_with_system/stream_chat_with_history 接口，实现 token 级实时流式推送。涉及：1) Provider 实现真正的 SSE 流式接口；2) agent loop 改为流式消费 + 工具调用混合模式；3) 前端逐 token 渲染。",
+    "priority": "P2",
+    "passes": false,
+    "added": "2026-03-18"
+  },
+  {
+    "id": "F003",
+    "title": "Agent 核心 Loop 统一与 History 类型统一",
+    "description": "将 Agent::turn() 的内部 loop 体替换为对 run_tool_call_loop() 的委托调用，消除两套重复实现。具体步骤：Phase 1 — run_tool_call_loop() 新增 event_sender 参数，6 处注入 AgentEvent 发送逻辑；Phase 2 — turn() 删除自有 loop 体，改为调用 run_tool_call_loop()，history 从 Vec<ConversationMessage> 统一为 Vec<ChatMessage>；Phase 3 — 删除 ConversationMessage 枚举、ToolDispatcher trait 及 dispatcher.rs。详见 docs/architecture/agent-loop-unification_V1.0_202603251749.md",
+    "priority": "P0",
+    "passes": true,
+    "added": "2026-03-25"
+  },
+  {
+    "id": "F004",
+    "title": "WebSocket 路径能力补齐（已拆分为 F004a-F004d）",
+    "description": "原始需求已拆分为 4 个独立 feature：F004a（ProviderRuntimeOptions）、F004b（MCP 工具初始化）、F004c（Peripheral 工具）、F004d（Memory auto_save 门槛）。详见 docs/architecture/orchestration-paths-analysis_V1.0_202603251804.md 第 3 节",
+    "priority": "P0",
+    "passes": true,
+    "added": "2026-03-25",
+    "split_into": ["F004a", "F004b", "F004c", "F004d"]
+  },
+  {
+    "id": "F004a",
+    "title": "WS 路径 Provider 改用 ProviderRuntimeOptions",
+    "description": "Agent::from_config() 中 Provider 初始化使用 create_routed_provider 缺少关键配置。改用 create_routed_provider_with_options，传入 ProviderRuntimeOptions（reasoning_enabled、provider_timeout_secs、extra_headers、api_path、secrets_encrypt 等），使 WS 路径与 CLI/Channel/Gateway 保持一致。参考实现：loop_.rs L3264-3283。",
+    "priority": "P0",
+    "passes": true,
+    "added": "2026-03-26"
+  },
+  {
+    "id": "F004b",
+    "title": "WS 路径补齐 MCP 工具初始化",
+    "description": "Agent::from_config() 未调用 McpRegistry::connect_all，导致 WS 用户无法使用 MCP 集成的外部工具。需在 from_config 中增加 MCP 初始化逻辑（检查 config.mcp.enabled、connect_all、支持 deferred_loading）。注意：需将 from_config 改为 async fn。参考实现：channels/mod.rs L3829-3834。",
+    "priority": "P3",
+    "passes": false,
+    "added": "2026-03-26"
+  },
+  {
+    "id": "F004c",
+    "title": "WS 路径补齐 Peripheral 工具",
+    "description": "Agent::from_config() 调用 all_tools_with_runtime() 后未追加 Peripheral 工具，导致 WS 用户无法控制硬件外设。需在 from_config 中追加 create_peripheral_tools(&config.peripherals) 调用。注意：需 async 上下文。参考实现：loop_.rs L3158-3163。",
+    "priority": "P3",
+    "passes": false,
+    "added": "2026-03-26"
+  },
+  {
+    "id": "F004d",
+    "title": "WS 路径 Memory auto_save 增加长度门槛",
+    "description": "Agent::turn() 中 auto_save 无条件存储用户消息，短消息（hi/ok/嗯）也写入 Memory 造成噪音。需增加 AUTOSAVE_MIN_MESSAGE_CHARS（20 字符）最低长度检查和 should_skip_autosave_content 内容过滤，与其他 3 条路径保持一致。参考实现：loop_.rs L3465-3469。",
+    "priority": "P3",
+    "passes": false,
+    "added": "2026-03-26"
+  },
+  {
+    "id": "F005",
+    "title": "提取共有编排步骤为可复用模块",
+    "description": "将 4 条路径中重复的外层编排逻辑抽取为共享模块：1) ComponentFactory::from_config() — 统一 Provider/Memory/Observer/Security/Tools/MCP/Peripheral 初始化；2) enrich_message() — 统一 memory 上下文加载 + 时间戳注入；3) auto_save_user_message() — 统一 memory 自动存储 + 长度门槛；4) HistoryManager::trim() — 统一 history 裁剪/压缩策略。详见 docs/architecture/orchestration-paths-analysis_V1.0_202603251804.md 第 4.2 节",
+    "priority": "P3",
+    "passes": false,
+    "added": "2026-03-25"
+  }
+]
