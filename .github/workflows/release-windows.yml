@@ -1,0 +1,91 @@
+name: Release Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.4.4-win)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  web:
+    name: Build Web Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: cd web && npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  build:
+    name: Build Windows x86_64
+    needs: [web]
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Build release
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --features channel-weixin
+
+      - name: Package
+        run: |
+          cd target/x86_64-pc-windows-msvc/release
+          7z a ../../../zeroclaw-windows-x86_64.zip zeroclaw.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-windows
+          path: zeroclaw-windows-x86_64.zip
+          retention-days: 14
+
+  release:
+    name: Create Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: zeroclaw-windows
+          path: artifacts/
+
+      - name: Generate checksum
+        run: |
+          cd artifacts
+          sha256sum zeroclaw-windows-x86_64.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.tag }}" artifacts/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ inputs.tag }} (Windows)" \
+            --notes "Windows x86_64 release with WeChat channel support." \
+            --prerelease
