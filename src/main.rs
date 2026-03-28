@@ -1338,13 +1338,13 @@ async fn weixin_login(config: &mut Config) -> Result<()> {
 
     #[cfg(not(feature = "channel-weixin"))]
     {
-        println!("QR code URL (scan with WeChat):");
-        println!("  {}", qr_resp.qrcode_img_content);
-        println!();
         println!(
             "Note: Build with `--features channel-weixin` to display QR code in terminal."
         );
     }
+
+    println!("QR code URL (open in browser or scan with WeChat):");
+    println!("  {}", qr_resp.qrcode_img_content);
 
     println!();
     println!("Scan the QR code with WeChat...");
