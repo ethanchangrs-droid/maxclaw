@@ -211,7 +211,7 @@
 - cargo test -- chat_sse gateway: 209 通过（含 3 个新测试），0 失败
 
 ### Git commit
-- （待提交）
+- 3ae66b1d feat(gateway): add SSE chat endpoint POST /api/chat (F010)
 
 ### 当前状态
 - F010 已完成并标记 passes: true

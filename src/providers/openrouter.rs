@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
+    reasoning_enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +69,13 @@ struct NativeChatRequest {
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReasoningConfig {
+    effort: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,7 +146,10 @@ struct NativeChoice {
 struct NativeResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    /// Reasoning/thinking models may return output in `reasoning_content`.
+    /// OpenRouter returns reasoning output as `reasoning`.
+    #[serde(default)]
+    reasoning: Option<String>,
+    /// Some upstream providers use `reasoning_content` (e.g. DeepSeek).
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
@@ -149,6 +160,24 @@ impl OpenRouterProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
+            reasoning_enabled: None,
+        }
+    }
+
+    pub fn with_reasoning(credential: Option<&str>, reasoning_enabled: Option<bool>) -> Self {
+        Self {
+            credential: credential.map(ToString::to_string),
+            reasoning_enabled,
+        }
+    }
+
+    fn reasoning_config(&self) -> Option<ReasoningConfig> {
+        if self.reasoning_enabled == Some(true) {
+            Some(ReasoningConfig {
+                effort: "high".to_string(),
+            })
+        } else {
+            None
         }
     }
 
@@ -275,7 +304,7 @@ impl OpenRouterProvider {
     }
 
     fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
-        let reasoning_content = message.reasoning_content.clone();
+        let reasoning_content = message.reasoning.clone().or(message.reasoning_content.clone());
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -444,6 +473,7 @@ impl Provider for OpenRouterProvider {
             temperature,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            reasoning: self.reasoning_config(),
         };
 
         let response = self
@@ -536,6 +566,7 @@ impl Provider for OpenRouterProvider {
             temperature,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
+            reasoning: self.reasoning_config(),
         };
 
         let response = self
@@ -789,6 +820,7 @@ mod tests {
     fn parse_native_response_converts_to_chat_response() {
         let message = NativeResponseMessage {
             content: Some("Here you go.".into()),
+            reasoning: None,
             reasoning_content: None,
             tool_calls: Some(vec![NativeToolCall {
                 id: Some("call_789".into()),
@@ -903,7 +935,8 @@ mod tests {
     fn parse_native_response_captures_reasoning_content() {
         let message = NativeResponseMessage {
             content: Some("answer".into()),
-            reasoning_content: Some("thinking step".into()),
+            reasoning: Some("thinking step".into()),
+            reasoning_content: None,
             tool_calls: Some(vec![NativeToolCall {
                 id: Some("call_1".into()),
                 kind: Some("function".into()),
@@ -922,6 +955,7 @@ mod tests {
     fn parse_native_response_none_reasoning_content_for_normal_model() {
         let message = NativeResponseMessage {
             content: Some("hello".into()),
+            reasoning: None,
             reasoning_content: None,
             tool_calls: None,
         };

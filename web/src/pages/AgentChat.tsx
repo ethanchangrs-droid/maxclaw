@@ -4,11 +4,19 @@ import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
+import ReasoningBlock from '@/components/ReasoningBlock';
+import ToolCallCard from '@/components/ToolCallCard';
 
 interface ChatMessage {
   id: string;
   role: 'user' | 'agent';
+  type: 'text' | 'reasoning' | 'tool_call' | 'tool_result';
   content: string;
+  toolName?: string;
+  toolArgs?: any;
+  toolOutput?: string;
+  toolSuccess?: boolean;
+  toolDuration?: number;
   timestamp: Date;
 }
 
@@ -65,6 +73,7 @@ export default function AgentChat() {
               {
                 id: generateUUID(),
                 role: 'agent',
+                type: 'text',
                 content,
                 timestamp: new Date(),
               },
@@ -75,13 +84,29 @@ export default function AgentChat() {
           break;
         }
 
+        case 'reasoning':
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: generateUUID(),
+              role: 'agent',
+              type: 'reasoning',
+              content: msg.content ?? '',
+              timestamp: new Date(),
+            },
+          ]);
+          break;
+
         case 'tool_call':
           setMessages((prev) => [
             ...prev,
             {
               id: generateUUID(),
               role: 'agent',
-              content: `[Tool Call] ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
+              type: 'tool_call',
+              content: '',
+              toolName: msg.name,
+              toolArgs: msg.args,
               timestamp: new Date(),
             },
           ]);
@@ -93,7 +118,12 @@ export default function AgentChat() {
             {
               id: generateUUID(),
               role: 'agent',
-              content: `[Tool Result] ${msg.output ?? ''}`,
+              type: 'tool_result',
+              content: '',
+              toolName: msg.name,
+              toolOutput: msg.output,
+              toolSuccess: msg.success,
+              toolDuration: msg.duration_ms,
               timestamp: new Date(),
             },
           ]);
@@ -105,6 +135,7 @@ export default function AgentChat() {
             {
               id: generateUUID(),
               role: 'agent',
+              type: 'text',
               content: `[Error] ${msg.message ?? 'Unknown error'}`,
               timestamp: new Date(),
             },
@@ -136,6 +167,7 @@ export default function AgentChat() {
       {
         id: generateUUID(),
         role: 'user',
+        type: 'text' as const,
         content: trimmed,
         timestamp: new Date(),
       },
@@ -199,68 +231,94 @@ export default function AgentChat() {
           </div>
         )}
 
-        {messages.map((msg, idx) => (
-          <div
-            key={msg.id}
-            className={`group flex items-start gap-3 ${
-              msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
-            }`}
-            style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
-          >
+        {messages.map((msg, idx) => {
+          if (msg.type === 'reasoning') {
+            return (
+              <div key={msg.id} style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}>
+                <ReasoningBlock content={msg.content} timestamp={msg.timestamp} />
+              </div>
+            );
+          }
+
+          if (msg.type === 'tool_call' || msg.type === 'tool_result') {
+            return (
+              <div key={msg.id} style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}>
+                <ToolCallCard
+                  type={msg.type}
+                  toolName={msg.toolName}
+                  toolArgs={msg.toolArgs}
+                  toolOutput={msg.toolOutput}
+                  toolSuccess={msg.toolSuccess}
+                  toolDuration={msg.toolDuration}
+                  timestamp={msg.timestamp}
+                />
+              </div>
+            );
+          }
+
+          return (
             <div
-              className={`flex-shrink-0 w-8 h-8 rounded-xl flex items-center justify-center ${
-                msg.role === 'user'
-                  ? ''
-                  : ''
+              key={msg.id}
+              className={`group flex items-start gap-3 ${
+                msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
               }`}
-              style={{
-                background: msg.role === 'user'
-                  ? 'linear-gradient(135deg, #0080ff, #0060cc)'
-                  : 'linear-gradient(135deg, #1a1a3e, #12122a)'
-              }}
+              style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
             >
-              {msg.role === 'user' ? (
-                <User className="h-4 w-4 text-white" />
-              ) : (
-                <Bot className="h-4 w-4 text-[#0080ff]" />
-              )}
-            </div>
-            <div className="relative max-w-[75%]">
               <div
-                className={`rounded-2xl px-4 py-3 ${
+                className={`flex-shrink-0 w-8 h-8 rounded-xl flex items-center justify-center ${
                   msg.role === 'user'
-                    ? 'text-white'
-                    : 'text-[#e8edf5] border border-[#1a1a3e]'
+                    ? ''
+                    : ''
                 }`}
                 style={{
                   background: msg.role === 'user'
-                    ? 'linear-gradient(135deg, #0080ff, #0066cc)'
-                    : 'linear-gradient(135deg, rgba(13,13,32,0.8), rgba(10,10,26,0.6))'
+                    ? 'linear-gradient(135deg, #0080ff, #0060cc)'
+                    : 'linear-gradient(135deg, #1a1a3e, #12122a)'
                 }}
               >
-                <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
-                <p
-                  className={`text-[10px] mt-1.5 ${
-                    msg.role === 'user' ? 'text-white/50' : 'text-[#334060]'
-                  }`}
-                >
-                  {msg.timestamp.toLocaleTimeString()}
-                </p>
-              </div>
-              <button
-                onClick={() => handleCopy(msg.id, msg.content)}
-                aria-label="Copy message"
-                className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-all duration-300 p-1.5 rounded-lg bg-[#0a0a18] border border-[#1a1a3e] text-[#556080] hover:text-white hover:border-[#0080ff40]"
-              >
-                {copiedId === msg.id ? (
-                  <Check className="h-3 w-3 text-[#00e68a]" />
+                {msg.role === 'user' ? (
+                  <User className="h-4 w-4 text-white" />
                 ) : (
-                  <Copy className="h-3 w-3" />
+                  <Bot className="h-4 w-4 text-[#0080ff]" />
                 )}
-              </button>
+              </div>
+              <div className="relative max-w-[75%]">
+                <div
+                  className={`rounded-2xl px-4 py-3 ${
+                    msg.role === 'user'
+                      ? 'text-white'
+                      : 'text-[#e8edf5] border border-[#1a1a3e]'
+                  }`}
+                  style={{
+                    background: msg.role === 'user'
+                      ? 'linear-gradient(135deg, #0080ff, #0066cc)'
+                      : 'linear-gradient(135deg, rgba(13,13,32,0.8), rgba(10,10,26,0.6))'
+                  }}
+                >
+                  <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
+                  <p
+                    className={`text-[10px] mt-1.5 ${
+                      msg.role === 'user' ? 'text-white/50' : 'text-[#334060]'
+                    }`}
+                  >
+                    {msg.timestamp.toLocaleTimeString()}
+                  </p>
+                </div>
+                <button
+                  onClick={() => handleCopy(msg.id, msg.content)}
+                  aria-label="Copy message"
+                  className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-all duration-300 p-1.5 rounded-lg bg-[#0a0a18] border border-[#1a1a3e] text-[#556080] hover:text-white hover:border-[#0080ff40]"
+                >
+                  {copiedId === msg.id ? (
+                    <Check className="h-3 w-3 text-[#00e68a]" />
+                  ) : (
+                    <Copy className="h-3 w-3" />
+                  )}
+                </button>
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
 
         {typing && (
           <div className="flex items-start gap-3 animate-fade-in">

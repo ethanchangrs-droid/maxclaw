@@ -34,9 +34,19 @@ services:
       # Model override
       - ZEROCLAW_MODEL=${ZEROCLAW_MODEL:-anthropic/claude-sonnet-4}
       
+      # Reasoning/thinking mode
+      - ZEROCLAW_REASONING_ENABLED=${ZEROCLAW_REASONING_ENABLED:-false}
+    
+    # Run in daemon mode (gateway + channels + scheduler).
+    # Default CMD in Dockerfile is "gateway" (API only, no channels).
+    # Use "daemon" to enable WeChat/Telegram/Discord etc. channel listening.
+    command: ["daemon"]
+
     volumes:
       # Persist workspace and config (must match WORKDIR/HOME in Dockerfile)
       - zeroclaw-data:/zeroclaw-data
+      # Eval: bind-mount evalspace so test cases can access files inside container
+      - /Users/david/Desktop/pitem/downloadcode/agent/agenteval/evalspace:/zeroclaw-data/workspace/evalspace
       
     ports:
       # Gateway API port (override HOST_PORT if 42617 is taken)

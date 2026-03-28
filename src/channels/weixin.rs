@@ -1,7 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,10 +33,10 @@ pub struct WeixinChannel {
 
 #[derive(Debug, Deserialize)]
 struct GetUpdatesResp {
-    #[serde(default)]
-    errcode: i64,
-    #[serde(default)]
-    errmsg: Option<String>,
+    #[serde(alias = "ret", alias = "errcode", default)]
+    ret: i64,
+    #[serde(alias = "err_msg", alias = "errmsg", default)]
+    err_msg: Option<String>,
     #[serde(default)]
     msgs: Vec<WeixinMessage>,
     #[serde(default)]
@@ -73,12 +73,12 @@ struct TextItem {
     text: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct SendMessageResp {
-    #[serde(default)]
-    errcode: i64,
-    #[serde(default)]
-    errmsg: Option<String>,
+    #[serde(alias = "ret", alias = "errcode", default)]
+    ret: i64,
+    #[serde(alias = "err_msg", alias = "errmsg", default)]
+    err_msg: Option<String>,
 }
 
 impl WeixinChannel {
@@ -163,9 +163,9 @@ impl WeixinChannel {
         }
 
         let data: GetUpdatesResp = resp.json().await?;
-        if data.errcode != 0 {
-            let msg = data.errmsg.as_deref().unwrap_or("unknown");
-            anyhow::bail!("iLink getupdates errcode={}: {msg}", data.errcode);
+        if data.ret != 0 {
+            let msg = data.err_msg.as_deref().unwrap_or("unknown");
+            anyhow::bail!("iLink getupdates ret={}: {msg}", data.ret);
         }
 
         Ok((data.msgs, data.get_updates_buf))
@@ -184,13 +184,18 @@ impl WeixinChannel {
             .post(&url)
             .headers(self.build_headers())
             .json(&serde_json::json!({
-                "to_user_id": to,
-                "context_token": context_token,
-                "client_msg_id": client_id,
-                "item_list": [{
-                    "type": 1,
-                    "text_item": { "text": text }
-                }]
+                "msg": {
+                    "to_user_id": to,
+                    "context_token": context_token,
+                    "client_id": client_id,
+                    "message_type": 2,
+                    "message_state": 2,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": { "text": text }
+                    }]
+                },
+                "base_info": { "channel_version": "2.0.0" }
             }))
             .send()
             .await?;
@@ -201,10 +206,13 @@ impl WeixinChannel {
             anyhow::bail!("iLink sendmessage HTTP {status}: {body}");
         }
 
-        let result: SendMessageResp = resp.json().await?;
-        if result.errcode != 0 {
-            let msg = result.errmsg.as_deref().unwrap_or("unknown");
-            anyhow::bail!("iLink sendmessage errcode={}: {msg}", result.errcode);
+        let body = resp.text().await.unwrap_or_default();
+        if !body.is_empty() && body != "{}" {
+            let result: SendMessageResp = serde_json::from_str(&body)?;
+            if result.ret != 0 {
+                let msg = result.err_msg.as_deref().unwrap_or("unknown");
+                anyhow::bail!("iLink sendmessage ret={}: {msg}", result.ret);
+            }
         }
 
         Ok(())
@@ -449,9 +457,9 @@ impl Channel for WeixinChannel {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
-                    if err_str.contains("errcode=-14") {
+                    if err_str.contains("ret=-14") || err_str.contains("errcode=-14") {
                         tracing::error!(
-                            "WeiXin: session expired (errcode=-14). \
+                            "WeiXin: session expired (ret=-14). \
                              Please re-scan QR code and update bot_token."
                         );
                         return Err(e);

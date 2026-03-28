@@ -1,0 +1,65 @@
+---
+description: 长时间开发管理流程规范，包括项目初始化、增量开发会话流程、feature_list.json和claude-progress.txt使用规范
+alwaysApply: true
+---
+
+# 长时间开发管理流程规范
+
+## 开发项目初始化
+- 完成需求文档后，创建 feature_list.json、claude-progress.txt、init.sh，注意遵守 feature_list.json 使用规范和claude-progress.txt 使用规范
+- 从 PRD/SPEC/UI 中提取**所有功能点**（不只是顶层功能）
+
+## 增量开发前准备
+- 开发新功能前，必须先阅读相关文档（PRD、SPEC、UI 设计文档）
+- 确认功能需求、技术方案、UI 设计后再开始编码
+- 如文档不完整或有疑问，先澄清再开发
+
+## 增量开发会话
+
+### 会话开始流程
+1. 运行 `pwd` 确认工作目录
+2. 读取 `claude-progress.txt` 了解当前进度
+3. **读取 `feature_list.json`**，找到下一个 `passes: false` 且优先级最高的任务
+4. 检查 git log 了解最近的代码变更
+5. 如有 `init.sh`，确保环境正常（尤其是首次会话）
+
+### 增量开发原则
+- 每次会话只实现**一个功能**（feature_list 中的一条）；每个功能开发完成后，询问并等待确认是否继续开发（按 priority 选择）
+- 功能完成后**必须进行端到端测试**，注意遵守测试规范
+- 禁止一次性实现多个功能，避免上下文耗尽时半完成状态
+
+### 会话结束流程
+1. 确保代码处于可运行状态（无语法错误、无明显 Bug）
+2. 提交 git commit（遵循约定式提交格式）
+3. **测试通过后**，更新 feature_list.json：完成的功能标记 `passes: true`
+4. 每次会话结束更新 claude-progress.txt：记录完成内容、当前状态、下一步
+5. 如有未完成的功能，在进度文件中明确标注阻塞原因
+6. 注意遵守 feature_list.json 使用规范和claude-progress.txt 使用规范
+
+### 代码状态要求
+- 每次会话结束时，代码应处于"可合并到 main"的状态
+- 不允许留下半完成的功能、未处理的 TODO、明显的 Bug
+- 如确实无法完成，在进度文件中详细记录当前状态和阻塞原因
+- 使用 git revert 回退到可工作状态，而非留下损坏的代码
+
+## claude-progress.txt 使用规范
+- claude-progress.txt 每次会话必须更新
+- 记录会话历史，不用于任务管理（任务在feature_list.json）
+- 明确标注下一个待完成的功能，"下一步"字段应引用 feature_list.json 中的功能 ID
+- 保持简洁，避免冗长描述
+- 记录 git commit hash 便于回溯
+
+## feature_list.json 使用规范
+- **feature_list.json 是唯一任务管理工具**，记录项目所有功能和任务
+- feature_list.json 使用 JSON 格式，避免随意修改结构
+- 只能修改 passes 字段（true/false），不可删除或编辑功能描述
+- 新增功能需求时，添加到文件末尾，分配新的 ID
+- 定期核对功能清单与 PRD 的一致性
+
+**必须遵守**：
+- ✅ 从需求文档提取**所有功能点**（包括核心功能、优化项、测试、部署等）
+- ✅ 新任务直接添加到此文件，不要散落在文档中
+- ✅ 功能完成并**测试通过后**才能标记 `passes: true`
+- ✅ 使用 priority 字段标记优先级，控制开发顺序
+- ❌ 禁止只记录顶层功能
+- ❌ 禁止把任务记录在 PRD/SPEC/评估报告/progress 文件中
